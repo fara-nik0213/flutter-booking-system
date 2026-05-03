@@ -4,7 +4,9 @@
 
 🔗 **[Посмотреть приложение вживую](https://skazka-base-2026.web.app/)**
 ## 📱 Демонстрация работы
-*(Сюда можно вставить скриншоты или GIF-анимацию)*
+*
+https://github.com/user-attachments/assets/3a0e738d-ab64-4de6-b8ae-6bda290fd5dc
+*
 
 ## ✨ Ключевые функции
 
