@@ -1,0 +1,4389 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:intl/intl.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import 'firebase_options.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  FirebaseFirestore.instance.settings = const Settings(
+    persistenceEnabled: true,
+    cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+  );
+
+  // Инициализация русского языка для дат
+  await initializeDateFormatting('ru', null);
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
+
+  final dataProvider = DataBaseProvider();
+  await dataProvider.loadAccommodations();
+  await dataProvider.loadServices();
+  dataProvider.listenToTransactions();
+
+  runApp(
+    MultiProvider(
+      providers: [ChangeNotifierProvider.value(value: dataProvider)],
+      child: const AltaiBaseApp(),
+    ),
+  );
+}
+
+// -----------------------------------------------------------------------------
+// 1. МОДЕЛИ ДАННЫХ (MODELS)
+// -----------------------------------------------------------------------------
+
+enum ItemType { accommodation, service, custom }
+
+class BookingItem {
+  String id;
+  String title;
+  String description;
+  int price;
+  String unit;
+  String image;
+  List<String> images;
+  ItemType type;
+  int capacity;
+
+  BookingItem({
+    required this.id,
+    required this.title,
+    this.description = '',
+    required this.price,
+    this.unit = '',
+    this.image = '',
+    this.images = const [],
+    required this.type,
+    this.capacity = 2,
+  });
+}
+
+class Booking {
+  final String id;
+  final String customerName;
+  final String customerPhone;
+  final BookingItem item;
+  final DateTime startDate;
+  final DateTime endDate;
+  final int totalPrice;
+  int prepayment;
+  bool isConfirmed;
+  final String userId;
+
+  Booking({
+    required this.id,
+    required this.customerName,
+    required this.customerPhone,
+    required this.item,
+    required this.startDate,
+    required this.endDate,
+    required this.totalPrice,
+    required this.prepayment,
+    this.isConfirmed = false,
+    this.userId = '',
+  });
+}
+
+class Expense {
+  final String id;
+  final String title;
+  final int amount;
+  final DateTime date;
+  final String category;
+
+  Expense({
+    required this.id,
+    required this.title,
+    required this.amount,
+    required this.date,
+    this.category = 'Общее',
+  });
+}
+
+class Income {
+  final String id;
+  final String title;
+  final int amount;
+  final DateTime date;
+  final String category;
+
+  Income({
+    required this.id,
+    required this.title,
+    required this.amount,
+    required this.date,
+    this.category = 'Общее',
+  });
+}
+
+// -----------------------------------------------------------------------------
+// 2. ПРОВАЙДЕР ДАННЫХ (STATE MANAGEMENT)
+// -----------------------------------------------------------------------------
+
+class DataBaseProvider with ChangeNotifier {
+  int selectedMonth = DateTime.now().month;
+  int selectedYear = DateTime.now().year;
+
+  bool isDemoMode = false;
+  DateTime? seasonStart;
+  DateTime? seasonEnd;
+  String currentUserId = ''; // <--- ХРАНИЛИЩЕ ID ТЕЛЕФОНА
+
+  final String prefix = '';
+
+  // --- НОВЫЙ МЕТОД: Генерируем или вспоминаем ID ---
+  Future<void> _initUserId() async {
+    final prefs = await SharedPreferences.getInstance();
+    currentUserId = prefs.getString('device_user_id') ?? '';
+    if (currentUserId.isEmpty) {
+      // Если человек зашел впервые - придумываем ему ID
+      currentUserId = 'user_${DateTime.now().millisecondsSinceEpoch}';
+      await prefs.setString('device_user_id', currentUserId);
+    }
+    notifyListeners();
+  }
+
+  // --- НАЧАЛО: Метод для проверки занятости дня в календаре ---
+  Map<String, dynamic> getDayStatus(DateTime day) {
+    final checkDay = DateTime(day.year, day.month, day.day);
+
+    // Список ID домиков, которые заняты в этот день
+    List<String> bookedItemsIds = [];
+
+    // Перебираем все бронирования
+    for (var t in _transactions) {
+      DateTime s = DateTime(t.startDate.year, t.startDate.month, t.startDate.day);
+      DateTime e = DateTime(t.endDate.year, t.endDate.month, t.endDate.day);
+
+      // Если день попадает в диапазон брони (от заезда до выезда не включительно)
+      if ((checkDay.isAtSameMomentAs(s) || checkDay.isAfter(s)) && checkDay.isBefore(e)) {
+        bookedItemsIds.add(t.itemId);
+      }
+    }
+
+    // Считаем общую вместимость (сколько всего домиков)
+    int totalCapacity = accommodations.fold(0, (sum, item) => sum + item.capacity);
+    int totalBooked = bookedItemsIds.length;
+
+    return {
+      'bookedCount': totalBooked,
+      'totalCapacity': totalCapacity,
+      'isFull': totalCapacity > 0 && totalBooked >= totalCapacity, // Заняты ли все доступные места
+      'bookedIds': bookedItemsIds,
+    };
+  }
+
+  StreamSubscription? _incomesSub;
+  StreamSubscription? _expensesSub;
+  StreamSubscription? _bookingsSub;
+
+  void changeDate(int m, int y) {
+    selectedMonth = m;
+    selectedYear = y;
+    notifyListeners();
+  }
+
+  DataBaseProvider() {
+    _init();
+  }
+
+  // Получаем доходы за конкретный месяц и год
+  double monthlyIncomes(int month, int year) {
+    return incomes
+        .where((i) => i.date.month == month && i.date.year == year)
+        .fold(0.0, (sum, item) => sum + item.amount);
+  }
+
+  // Получаем расходы за конкретный месяц и год
+  double monthlyExpenses(int month, int year) {
+    return expenses
+        .where((e) => e.date.month == month && e.date.year == year)
+        .fold(0.0, (sum, item) => sum + item.amount);
+  }
+
+  // Чистая прибыль за месяц
+  double monthlyNetProfit(int month, int year) =>
+      monthlyIncomes(month, year) - monthlyExpenses(month, year);
+
+  Future<void> _init() async {
+    await _initUserId();
+    await _loadFromDisk(); // Загрузили домики и брони
+    listenToTransactions(); // СРАЗУ начали слушать Firebase
+    await loadSeasonSettings();
+  }
+
+  List<BookingItem> accommodations = [];
+  List<BookingTransaction> _transactions = [];
+
+  List<BookingTransaction> get transactions => _transactions;
+
+  // 1. ЗАГРУЗКА ЖИЛЬЯ (уже есть, проверена)
+  // 1. ЗАГРУЗКА ЖИЛЬЯ
+  Future<void> loadAccommodations() async {
+    try {
+      var snapshot = await FirebaseFirestore.instance
+          .collection('${prefix}accommodations')
+          .get();
+      accommodations = snapshot.docs.map((doc) {
+        var data = doc.data();
+        String itemTitle = data['title'] ?? 'Без названия';
+
+        // --- УМНАЯ ПОДСТАНОВКА ЛИМИТОВ ---
+        int itemCap = (data['capacity'] as num?)?.toInt() ?? 1;
+        String titleLower = itemTitle.toLowerCase().trim();
+        if (titleLower.contains('верхний')) {
+          itemCap = 2; // Верхний теремок — 2 места [cite: 37]
+        } else if (titleLower.contains('нижний')) {
+          itemCap = 2; // Нижний теремок — 2 места [cite: 37]
+        } else if (titleLower.contains('избушка')) {
+          itemCap = 1; // Избушка — 1 место [cite: 37]
+        } else if (titleLower == 'теремок') {
+          itemCap = 1; // Только объект с точным именем "Теремок" — 1 место [cite: 38]
+        }
+
+        return BookingItem(
+          id: doc.id,
+          title: itemTitle,
+          price: (data['price'] as num?)?.toInt() ?? 0,
+          capacity: itemCap,
+          // Используем вычисленный лимит
+          unit: data['unit'] ?? 'сутки',
+          image: data['image'] ?? '',
+          images: data['images'] != null
+              ? List<String>.from(data['images'])
+              : [],
+          description: data['description'] ?? '',
+          type: ItemType.accommodation,
+        );
+      }).toList();
+      accommodations.add(BookingItem(
+        id: 'combo_teremok',
+        title: 'Весь Теремок (Оба этажа)',
+        price: 10000, // Исправленная цена за весь теремок[cite: 7]
+        capacity: 1,  // Бронируется как 1 цельный объект
+        unit: 'сутки',
+        description: 'Бронирование всего Теремка (верхний и нижний этаж).',
+        type: ItemType.accommodation,
+      ));
+
+      accommodations.add(BookingItem(
+        id: 'combo_base',
+        title: 'Вся Турбаза',
+        price: 15000, // Исправленная цена за всю базу[cite: 7]
+        capacity: 1,  // Бронируется как 1 цельный объект
+        unit: 'сутки',
+        description: 'Бронирование всей территории турбазы полностью.',
+        type: ItemType.accommodation,
+      ));
+      notifyListeners();
+      print("✅ Жилье загружено: ${accommodations.length}");
+    } catch (e) {
+      print("❌ Ошибка загрузки жилья: $e");
+    }
+  }
+
+  // 2. ЗАГРУЗКА УСЛУГ (уже есть, проверена)
+  Future<void> loadServices() async {
+    try {
+      var snapshot = await FirebaseFirestore.instance
+          .collection('${prefix}services')
+          .get();
+      services = snapshot.docs.map((doc) {
+        var data = doc.data();
+        return BookingItem(
+          id: doc.id,
+          title: data['title'] ?? 'Без названия',
+          price: (data['price'] as num?)?.toInt() ?? 0,
+          unit: data['unit'] ?? '',
+          description: data['description'] ?? '',
+          image: data['image'] ?? '',
+          type: ItemType.service,
+        );
+      }).toList();
+      notifyListeners();
+      print("✅ Услуги загружены: ${services.length}");
+    } catch (e) {
+      print("❌ Ошибка загрузки услуг: $e");
+    }
+  }
+
+  List<BookingItem> services = [
+    BookingItem(
+      id: 's1',
+      title: 'Заброска на Мультинские озёра',
+      description: 'Поездка на ГАЗ-66 или УАЗ. Экстремально и красиво.',
+      price: 2500,
+      unit: 'поездку',
+      type: ItemType.service,
+    ),
+    BookingItem(
+      id: 's2',
+      title: 'Конные прогулки',
+      description: 'Прогулки на конях по окрестностям.',
+      price: 1500,
+      unit: 'час',
+      type: ItemType.service,
+    ),
+    BookingItem(
+      id: 's3',
+      title: 'Конные туры',
+      description: 'Длительные маршруты в горы на весь день.',
+      price: 5000,
+      unit: 'день',
+      type: ItemType.service,
+    ),
+    BookingItem(
+      id: 's4',
+      title: 'Заброска на Башталинские озёра',
+      description: 'Подъем на УАЗе к высокогорным озёрам.',
+      price: 2500,
+      unit: 'поездку',
+      type: ItemType.service,
+    ),
+    BookingItem(
+      id: 's5',
+      title: 'Заброска на Красную гору',
+      description: 'Поездка на УАЗе к подножию Красной горы.',
+      price: 2500,
+      unit: 'поездку',
+      type: ItemType.service,
+    ),
+    BookingItem(
+      id: 's_tents',
+      title: 'Проживание в палатках',
+      description:
+          'Место на территории базы для установки вашей палатки. Доступ ко всей инфраструктуре (душ, костровище).',
+      price: 500,
+      unit: 'сутки/чел',
+      image: '',
+      // Оставляем пустым, раз фото не нужно
+      type: ItemType.service,
+    ),
+  ];
+
+  List<Booking> bookings = [];
+
+  // Геттер для подсчета только ПОДТВЕРЖДЕННОГО дохода
+  int get totalRevenue {
+    return bookings
+        .where(
+          (b) => b.isConfirmed,
+        ) // Фильтруем: только те, где нажата кнопка "Подтвердить"
+        .fold(0, (sum, b) => sum + b.totalPrice); // Суммируем их стоимость
+  }
+
+  // Геттер для подсчета того, что еще НЕ подтверждено (по желанию)
+  int get pendingRevenue {
+    return bookings
+        .where((b) => !b.isConfirmed)
+        .fold(0, (sum, b) => sum + b.totalPrice);
+  }
+
+  List<Expense> expenses = [];
+
+  List<Income> incomes = []; // Новый список для сторонних доходов
+  double get totalIncomes =>
+      incomes.fold(0.0, (sum, item) => sum + item.amount);
+
+  double get totalExpenses =>
+      expenses.fold(0.0, (sum, item) => sum + item.amount);
+
+  double get totalProfit => totalIncomes - totalExpenses;
+
+  // Этот метод заставляет приложение "слушать" базу данных постоянно
+  void listenToTransactions() {
+    // 1. Слушаем доходы (с защитой от кривых дат)
+    _incomesSub = FirebaseFirestore.instance
+        .collection('${prefix}incomes')
+        .snapshots()
+        .listen((snapshot) {
+          incomes.clear();
+          for (var doc in snapshot.docs) {
+            final data = doc.data();
+            incomes.add(
+              Income(
+                id: doc.id,
+                title: data['title'] ?? '',
+                amount: (data['amount'] as num?)?.toInt() ?? 0,
+                date: DateTime.tryParse(data['date'] ?? '') ?? DateTime.now(),
+                category: data['category'] ?? 'Общее',
+              ),
+            );
+          }
+          notifyListeners();
+        });
+
+    // 2. Слушаем расходы (с защитой от кривых дат)
+    _expensesSub = FirebaseFirestore.instance
+        .collection('${prefix}expenses')
+        .snapshots()
+        .listen((snapshot) {
+          expenses.clear();
+          for (var doc in snapshot.docs) {
+            final data = doc.data();
+            expenses.add(
+              Expense(
+                id: doc.id,
+                title: data['title'] ?? '',
+                amount: (data['amount'] as num?)?.toInt() ?? 0,
+                date: DateTime.tryParse(data['date'] ?? '') ?? DateTime.now(),
+                category: data['category'] ?? 'Общее',
+              ),
+            );
+          }
+          notifyListeners();
+        });
+
+    // 3. БРОНИРОВАНИЯ (БРОНЕЖИЛЕТ ОТ ОШИБОК)
+    _bookingsSub = FirebaseFirestore.instance
+        .collection('${prefix}bookings')
+        .snapshots()
+        .listen((snapshot) {
+          final List<BookingTransaction> validTransactions = [];
+
+          for (var doc in snapshot.docs) {
+            final data = doc.data();
+            try {
+              // Проверяем, что в базе есть все нужные поля, иначе игнорируем бронь
+              if (data['startDate'] != null &&
+                  data['endDate'] != null &&
+                  data['itemId'] != null) {
+                validTransactions.add(
+                  BookingTransaction(
+                    itemId: data['itemId'].toString(),
+                    startDate: DateTime.parse(data['startDate']),
+                    endDate: DateTime.parse(data['endDate']),
+                    userId: data['userId'] ?? '',
+                  ),
+                );
+              }
+            } catch (e) {
+              // Если старая бронь кривая, мы её просто игнорируем,
+              // чтобы она НЕ ЛОМАЛА весь остальной календарь!
+              debugPrint('Пропущена кривая бронь: ${doc.id}');
+            }
+          }
+
+          _transactions = validTransactions;
+          notifyListeners(); // Обновляем календарь при новых бронях
+        });
+  }
+
+  Future<void> addIncome(String title, int amount, DateTime date) async {
+    final monthKey = "${date.month}-${date.year}";
+
+    // ТОЛЬКО отправляем в Firebase.
+    // Твой метод listenToTransactions сам "поймает" это и добавит в список.
+    await FirebaseFirestore.instance.collection('${prefix}incomes').add({
+      'title': title,
+      'amount': amount,
+      'date': date.toIso8601String(),
+      'monthYear': monthKey,
+      'category': 'Общее', // Добавим категорию, чтобы не было ошибок
+    });
+  }
+
+  Future<void> confirmBooking(String bookingId, int prepaymentAmount) async {
+    final firestore = FirebaseFirestore.instance;
+
+    try {
+      // 1. ИЩЕМ БРОНЬ НАПРЯМУЮ В ОБЛАКЕ (чтобы работало для браузера)
+      DocumentSnapshot bookingSnap = await firestore
+          .collection('${prefix}bookings')
+          .doc(bookingId)
+          .get();
+
+      if (!bookingSnap.exists) {
+        print("❌ Бронь не найдена в базе");
+        return;
+      }
+
+      // Вытаскиваем данные для красивого сообщения в Телеграм
+      final data = bookingSnap.data() as Map<String, dynamic>;
+      String itemTitle = data['itemTitle'] ?? 'Неизвестный объект';
+      String customerName = data['customerName'] ?? 'Без имени';
+
+      // 2. ОБНОВЛЯЕМ СТАТУС И ПРЕДОПЛАТУ В ОБЛАКЕ
+      await firestore.collection('${prefix}bookings').doc(bookingId).update({
+        'isConfirmed': true,
+        'prepayment': prepaymentAmount,
+      });
+
+      // 3. Обновляем локально в памяти телефона, если бронь там есть
+      final index = bookings.indexWhere((b) => b.id == bookingId);
+      if (index != -1) {
+        bookings[index].isConfirmed = true;
+        bookings[index].prepayment = prepaymentAmount;
+        _saveToDisk();
+      }
+
+      notifyListeners(); // Перерисовываем экран (галочка появится мгновенно)
+
+      // 4. Отправляем красивое уведомление в Телеграм
+      sendTelegramMessage(
+        '✅ *Бронь подтверждена!*\n'
+        '🏠 Объект: $itemTitle\n'
+        '👤 Клиент: $customerName\n'
+        '💰 Внесена предоплата: $prepaymentAmount ₽',
+      );
+
+      print("✅ Бронь $bookingId успешно подтверждена!");
+    } catch (e) {
+      print("❌ Ошибка при подтверждении: $e");
+    }
+  }
+
+  Future<void> removeBooking(String id) async {
+    final firestore = FirebaseFirestore.instance;
+
+    try {
+      // 1. ИЩЕМ БРОНЬ НАПРЯМУЮ В ОБЛАКЕ (чтобы удалять даже те, что созданы с браузера/другого телефона)
+      DocumentSnapshot bookingSnap = await firestore
+          .collection('${prefix}bookings')
+          .doc(id)
+          .get();
+
+      if (!bookingSnap.exists) {
+        // Если в облаке брони уже нет, просто чистим локальный кэш
+        bookings.removeWhere((b) => b.id == id);
+        incomes.removeWhere((i) => i.id == id);
+        notifyListeners();
+        return;
+      }
+
+      // Вытаскиваем данные из облачного документа
+      final data = bookingSnap.data() as Map<String, dynamic>;
+      String itemId = data['itemId'];
+      DateTime startDate = DateTime.parse(data['startDate']);
+      DateTime endDate = DateTime.parse(data['endDate']);
+      String customerName = data['customerName'] ?? 'Без имени';
+      String itemTitle = data['itemTitle'] ?? 'Неизвестный объект';
+
+      // 2. ЗАПУСКАЕМ ТРАНЗАКЦИЮ ДЛЯ СНЯТИЯ ЗАМКА
+      await firestore.runTransaction((transaction) async {
+        DocumentReference lockRef = firestore
+            .collection('${prefix}calendar_locks')
+            .doc(itemId);
+        DocumentSnapshot lockSnapshot = await transaction.get(lockRef);
+
+        if (lockSnapshot.exists && lockSnapshot.data() != null) {
+          final lockData = lockSnapshot.data() as Map<String, dynamic>;
+          Map<String, int> occupancyMap = {};
+          lockData.forEach(
+            (key, value) => occupancyMap[key] = (value as num).toInt(),
+          );
+
+          // Высчитываем даты, которые нужно освободить
+          List<String> daysToRemove = [];
+          DateTime current = DateTime(
+            startDate.year,
+            startDate.month,
+            startDate.day,
+          );
+          DateTime end = DateTime(endDate.year, endDate.month, endDate.day);
+
+          while (current.isBefore(end)) {
+            daysToRemove.add(
+              "${current.year}-${current.month.toString().padLeft(2, '0')}-${current.day.toString().padLeft(2, '0')}",
+            );
+            current = current.add(const Duration(days: 1));
+          }
+          if (daysToRemove.isEmpty) {
+            daysToRemove.add(
+              "${current.year}-${current.month.toString().padLeft(2, '0')}-${current.day.toString().padLeft(2, '0')}",
+            );
+          }
+
+          // Вычитаем даты из замка
+          for (String day in daysToRemove) {
+            if (occupancyMap.containsKey(day)) {
+              occupancyMap[day] = occupancyMap[day]! - 1;
+              if (occupancyMap[day]! <= 0) {
+                occupancyMap.remove(
+                  day,
+                ); // Стираем дату полностью, если мест больше не занято
+              }
+            }
+          }
+
+          // Обновляем замок в базе
+          transaction.set(lockRef, occupancyMap);
+        }
+
+        // 3. Удаляем саму бронь и доход из облака
+        transaction.delete(firestore.collection('${prefix}bookings').doc(id));
+        transaction.delete(firestore.collection('${prefix}incomes').doc(id));
+      });
+
+      // 4. Удаляем из памяти телефона и обновляем экран
+      bookings.removeWhere((b) => b.id == id);
+      incomes.removeWhere((i) => i.id == id);
+      _saveToDisk();
+      notifyListeners();
+
+      // 5. Отправляем уведомление об отмене в Телеграм
+      sendTelegramMessage(
+        '❌ *Бронь отменена!*\n'
+        '🏠 Объект: $itemTitle\n'
+        '👤 Клиент: $customerName',
+      );
+
+      print("✅ Бронь удалена, замок снят!");
+    } catch (e) {
+      print("❌ Ошибка при удалении брони: $e");
+    }
+  }
+
+  void updateItemPrice(String id, int newPrice) {
+    // Ищем в домиках
+    for (var item in accommodations) {
+      if (item.id == id) {
+        item.price = newPrice;
+        sendTelegramMessage(
+          '⚠️ *Изменение цены на ${item.title}!*\n💰 Новая цена: $newPrice ₽',
+        );
+        break;
+      }
+    }
+    // Ищем в услугах
+    for (var item in services) {
+      if (item.id == id) {
+        item.price = newPrice;
+        break;
+      }
+    }
+    FirebaseFirestore.instance
+        .collection('${prefix}accommodations')
+        .doc(id)
+        .update({'price': newPrice});
+
+    _saveToDisk(); // Сохраняем, чтобы цена не слетела после перезагрузки
+    notifyListeners(); // Обновляем экран
+  }
+
+  // --- ФУНКЦИЯ СОХРАНЕНИЯ (Записывает всё на диск) ---
+  Future<void> _saveToDisk() async {
+    final prefs = await SharedPreferences.getInstance();
+    // 2. Сохраняем бронирования
+    final String encodedBookings = json.encode(
+      bookings
+          .map(
+            (b) => {
+              'id': b.id,
+              'customerName': b.customerName,
+              'customerPhone': b.customerPhone,
+              'itemId': b.item.id,
+              'startDate': b.startDate.toIso8601String(),
+              'endDate': b.endDate.toIso8601String(),
+              'totalPrice': b.totalPrice,
+              'prepayment': b.prepayment,
+              'isConfirmed': b.isConfirmed,
+              'userId': b.userId,
+            },
+          )
+          .toList(),
+    );
+    await prefs.setString('saved_bookings', encodedBookings);
+
+    // 3. СОХРАНЯЕМ ЦЕНЫ ДОМИКОВ (Новый блок!)
+    final String encodedPrices = json.encode(
+      accommodations.map((a) => {'id': a.id, 'price': a.price}).toList(),
+    );
+    await prefs.setString('saved_prices', encodedPrices);
+    final String encodedServices = json.encode(
+      services
+          .map(
+            (s) => {
+              'id': s.id,
+              'title': s.title,
+              'description': s.description,
+              'price': s.price,
+              'unit': s.unit,
+              'image': s.image,
+            },
+          )
+          .toList(),
+    );
+    await prefs.setString('saved_custom_services', encodedServices);
+  }
+
+  // --- ФУНКЦИЯ ЗАГРУЗКИ (Читает с диска при старте) ---
+  Future<void> _loadFromDisk() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? savedPrices = prefs.getString('saved_prices');
+    if (savedPrices != null) {
+      final List decodedPrices = json.decode(savedPrices);
+      for (var priceData in decodedPrices) {
+        // Ищем домик в списке и обновляем ему цену
+        for (var item in accommodations) {
+          if (item.id == priceData['id']) {
+            item.price = priceData['price'];
+          }
+        }
+      }
+    }
+    // Загружаем бронирования
+    final String? savedBookings = prefs.getString('saved_bookings');
+    if (savedBookings != null) {
+      final List decodedB = json.decode(savedBookings);
+      bookings = decodedB.map((data) {
+        // Проверяем: если ID 'manual', создаем заглушку прямо на лету
+        BookingItem item;
+        if (data['itemId'] == 'manual') {
+          item = BookingItem(
+            id: 'manual',
+            title: data['customerName'] ?? 'Ручной доход',
+            description: '',
+            price: 0,
+            unit: '',
+            type: ItemType.custom,
+          );
+        } else {
+          // Иначе ищем в списке домиков или услуг
+          item = accommodations.firstWhere(
+            (a) => a.id == data['itemId'],
+            orElse: () => services.firstWhere(
+              (s) => s.id == data['itemId'],
+              orElse: () => BookingItem(
+                id: 'unknown',
+                title: 'Удалено',
+                description: '',
+                price: 0,
+                unit: '',
+                type: ItemType.custom,
+              ),
+            ),
+          );
+        }
+
+        return Booking(
+          id: data['id'],
+          customerName: data['customerName'],
+          customerPhone: data['customerPhone'] ?? '',
+          item: item,
+          startDate: DateTime.parse(data['startDate']),
+          endDate: DateTime.parse(data['endDate']),
+          totalPrice: data['totalPrice'],
+          prepayment: data['prepayment'] ?? 0,
+          isConfirmed: data['isConfirmed'] ?? false,
+          userId: data['userId'] ?? '',
+        );
+      }).toList();
+    }
+    final String? savedServices = prefs.getString('saved_custom_services');
+    if (savedServices != null) {
+      final List decodedS = json.decode(savedServices);
+      services = decodedS
+          .map(
+            (data) => BookingItem(
+              id: data['id'],
+              title: data['title'],
+              description: data['description'],
+              price: data['price'],
+              unit: data['unit'],
+              type: ItemType.service,
+              image: data['image'] ?? '',
+            ),
+          )
+          .toList();
+    }
+    notifyListeners();
+  }
+
+  Future<void> addExpense(String title, int amount, DateTime date) async {
+    final monthKey = "${date.month}-${date.year}";
+
+    await FirebaseFirestore.instance.collection('${prefix}expenses').add({
+      'title': title,
+      'amount': amount,
+      'date': date.toIso8601String(),
+      'monthYear': monthKey,
+      'category': 'Общее',
+    });
+  }
+
+  // --- ПРАВИЛЬНЫЕ МЕТОДЫ УДАЛЕНИЯ ---
+  void deleteIncome(String id) {
+    incomes.removeWhere((i) => i.id == id);
+    FirebaseFirestore.instance.collection('${prefix}incomes').doc(id).delete();
+    notifyListeners();
+  }
+
+  void deleteExpense(String id) {
+    expenses.removeWhere((e) => e.id == id);
+    FirebaseFirestore.instance.collection('${prefix}expenses').doc(id).delete();
+    notifyListeners();
+  }
+
+  Future<bool> addBooking(Booking booking) async {
+    final firestore = FirebaseFirestore.instance;
+
+    try {
+      // 1. Берем лимит мест из самого объекта (1 или 2)
+      int limit = booking.item.capacity;
+
+      // ЗАПУСКАЕМ ТРАНЗАКЦИЮ
+      await firestore.runTransaction((transaction) async {
+        // 2. Ссылка на ДОКУМЕНТ-ЗАМОК (Один документ на каждый домик)
+        DocumentReference lockRef = firestore
+            .collection('${prefix}calendar_locks')
+            .doc(booking.item.id);
+
+        // ВАЖНО: Читаем именно этот документ внутри транзакции
+        DocumentSnapshot lockSnapshot = await transaction.get(lockRef);
+
+        // Карта занятости: {"2024-03-15": 1} (дата и сколько мест занято)
+        Map<String, int> occupancyMap = {};
+        if (lockSnapshot.exists && lockSnapshot.data() != null) {
+          final data = lockSnapshot.data() as Map<String, dynamic>;
+          data.forEach((key, value) => occupancyMap[key] = value as int);
+        }
+
+        // 3. Считаем даты бронирования
+        List<String> daysToBook = [];
+        DateTime current = DateTime(
+          booking.startDate.year,
+          booking.startDate.month,
+          booking.startDate.day,
+        );
+        DateTime end = DateTime(
+          booking.endDate.year,
+          booking.endDate.month,
+          booking.endDate.day,
+        );
+
+        while (current.isBefore(end)) {
+          daysToBook.add(
+            "${current.year}-${current.month.toString().padLeft(2, '0')}-${current.day.toString().padLeft(2, '0')}",
+          );
+          current = current.add(const Duration(days: 1));
+        }
+        if (daysToBook.isEmpty)
+          daysToBook.add(
+            "${current.year}-${current.month.toString().padLeft(2, '0')}-${current.day.toString().padLeft(2, '0')}",
+          );
+
+        // 4. ПРОВЕРКА МЕСТ: Если в любой из дней мест >= лимиту, отменяем всё
+        for (String day in daysToBook) {
+          int currentlyBooked = occupancyMap[day] ?? 0;
+          if (currentlyBooked >= limit) {
+            throw Exception(
+              "overlap",
+            ); // Бросаем ошибку, транзакция прервется автоматически
+          }
+        }
+
+        // 5. Если места есть — обновляем карту
+        for (String day in daysToBook) {
+          occupancyMap[day] = (occupancyMap[day] ?? 0) + 1;
+        }
+
+        // 6. ПИШЕМ ВСЁ В БАЗУ ОДНИМ ПАКЕТОМ
+        transaction.set(lockRef, occupancyMap); // Обновляем замок
+
+        DocumentReference bookingRef = firestore
+            .collection('${prefix}bookings')
+            .doc(booking.id);
+        transaction.set(bookingRef, {
+          'id': booking.id,
+          'customerName': booking.customerName,
+          'customerPhone': booking.customerPhone,
+          'itemId': booking.item.id,
+          'itemTitle': booking.item.title,
+          'startDate': booking.startDate.toIso8601String(),
+          'endDate': booking.endDate.toIso8601String(),
+          'totalPrice': booking.totalPrice,
+          'prepayment': booking.prepayment,
+          'isConfirmed': booking.isConfirmed,
+          'userId': booking.userId,
+          'timestamp': FieldValue.serverTimestamp(),
+        });
+
+        DocumentReference incRef = firestore
+            .collection('${prefix}incomes')
+            .doc(booking.id);
+        transaction.set(incRef, {
+          'id': booking.id,
+          'title': 'Бронирование: ${booking.customerName}',
+          'amount': booking.totalPrice,
+          'date': booking.startDate.toIso8601String(),
+          'category': 'Проживание',
+        });
+      });
+
+      // --- ЕСЛИ ТРАНЗАКЦИЯ УСПЕШНА ---
+      bookings.add(booking);
+      bookings.sort((a, b) => b.startDate.compareTo(a.startDate));
+
+      final newIncome = Income(
+        id: booking.id,
+        title: 'Бронирование: ${booking.customerName}',
+        amount: booking.totalPrice,
+        date: booking.startDate,
+        category: 'Проживание',
+      );
+      incomes.add(newIncome);
+
+      _saveToDisk();
+      notifyListeners();
+
+      sendTelegramMessage(
+        '🌲 *Новая бронь!*\n\n'
+        '🏠 *Объект:* ${booking.item.title}\n'
+        '👤 *Клиент:* ${booking.customerName}\n'
+        '📞 *Тел:* ${booking.customerPhone}\n'
+        '💰 *Сумма:* ${booking.totalPrice} ₽',
+      );
+
+      return true;
+    } catch (e) {
+      print("Ошибка при бронировании: $e");
+      return false;
+    }
+  }
+
+  // Загружаем настройки сезона из базы
+  Future<void> loadSeasonSettings() async {
+    try {
+      var doc = await FirebaseFirestore.instance
+          .collection('${prefix}settings')
+          .doc('season')
+          .get();
+      if (doc.exists && doc.data() != null) {
+        seasonStart = DateTime.tryParse(doc.data()!['start'] ?? '');
+        seasonEnd = DateTime.tryParse(doc.data()!['end'] ?? '');
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint("Ошибка загрузки сезона: $e");
+    }
+  }
+
+  // Сохраняем новые даты сезона
+  Future<void> saveSeasonSettings(DateTime start, DateTime end) async {
+    seasonStart = start;
+    seasonEnd = end;
+    notifyListeners();
+    await FirebaseFirestore.instance
+        .collection('${prefix}settings')
+        .doc('season')
+        .set({'start': start.toIso8601String(), 'end': end.toIso8601String()});
+  }
+
+  void removeService(String id) {
+    services.removeWhere((s) => s.id == id);
+    _saveToDisk(); // Сохраняем изменения на диск сразу
+    notifyListeners();
+  }
+
+  void updateItem(String id, String newTitle, int newPrice) {
+    for (var item in accommodations) {
+      if (item.id == id) {
+        item.title = newTitle;
+        item.price = newPrice;
+        _saveToDisk(); // <--- ОБЯЗАТЕЛЬНО ДОБАВЬ ЭТО ТУТ
+        notifyListeners();
+        return;
+      }
+    }
+    // То же самое для услуг, если нужно
+    for (var item in services) {
+      if (item.id == id) {
+        item.title = newTitle;
+        item.price = newPrice;
+        _saveToDisk(); // <--- И ТУТ
+        notifyListeners();
+        return;
+      }
+    }
+  }
+
+  void addService(String title, String desc, int price, String unit) {
+    final newService = BookingItem(
+      id: DateTime.now().toString(),
+      title: title,
+      description: desc,
+      price: price,
+      unit: unit,
+      type: ItemType.service,
+      image: '',
+    );
+    services.add(newService);
+    _saveToDisk(); // Сразу сохраняем на диск
+    notifyListeners();
+  }
+
+  int calculateMonthlyIncome(DateTime month) {
+    int total = 0;
+    // Считаем ТОЛЬКО сторонние доходы (куда теперь будут летать и брони)
+    for (var i in incomes) {
+      if (i.date.year == month.year && i.date.month == month.month) {
+        total += i.amount;
+      }
+    }
+    return total;
+  }
+
+  int calculateMonthlyExpenses(DateTime month) {
+    int total = 0;
+    for (var e in expenses) {
+      if (e.date.year == month.year && e.date.month == month.month) {
+        total += e.amount;
+      }
+    }
+    return total;
+  }
+
+  int calculateNetProfit(DateTime month) {
+    return calculateMonthlyIncome(month) - calculateMonthlyExpenses(month);
+  }
+
+  Future<void> sendTelegramMessage(String text) async {
+    const String token = '8652509432:AAF-Bg7Uoj0gqbLcFLjyyH7RgcmQdkVJZ9I';
+    const String chatId = '-5166132228';
+
+    final url = Uri.parse('https://api.telegram.org/bot$token/sendMessage');
+
+    try {
+      await http.post(
+        url,
+        body: {'chat_id': chatId, 'text': text, 'parse_mode': 'Markdown'},
+      );
+    } catch (e) {
+      debugPrint('Ошибка уведомления: $e');
+    }
+  }
+
+  // Обновление описания домика
+  Future<void> updateAccommodationDescription(
+    String itemId,
+    String newDesc,
+  ) async {
+    try {
+      await FirebaseFirestore.instance
+          .collection('${prefix}accommodations')
+          .doc(itemId)
+          .update({'description': newDesc});
+      final index = accommodations.indexWhere((a) => a.id == itemId);
+      if (index != -1) {
+        accommodations[index].description = newDesc;
+        notifyListeners();
+      }
+    } catch (e) {
+      print("Ошибка обновления описания: $e");
+    }
+  }
+
+  // Загрузка фото в облако и привязка к домику
+  Future<bool> uploadPhotoToAccommodation(
+    String itemId,
+    XFile pickedFile,
+  ) async {
+    try {
+      // Твой личный ключ ImgBB
+      const String apiKey = "0dd5acfb6502f372d500c8f8e22e2f6e";
+
+      // 1. Читаем файл в байты (работает и на телефоне, и в Chrome)
+      final Uint8List fileBytes = await pickedFile.readAsBytes();
+
+      // 2. Готовим запрос к API ImgBB
+      var request = http.MultipartRequest(
+        'POST',
+        Uri.parse('https://api.imgbb.com/1/upload?key=$apiKey'),
+      );
+
+      // Добавляем файл
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'image',
+          fileBytes,
+          filename: 'photo.jpg', // Мы всегда шлем как jpg, как ты и просил
+        ),
+      );
+
+      // 3. Отправляем
+      var streamedResponse = await request.send();
+      var response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        var jsonResponse = json.decode(response.body);
+        // Берем прямую ссылку на картинку
+        String downloadUrl = jsonResponse['data']['url'];
+
+        // 4. Записываем ссылку в базу данных Firebase
+        await FirebaseFirestore.instance
+            .collection('${prefix}accommodations')
+            .doc(itemId)
+            .update({
+              'images': FieldValue.arrayUnion([downloadUrl]),
+            });
+
+        // 5. Обновляем экран в приложении
+        final index = accommodations.indexWhere((a) => a.id == itemId);
+        if (index != -1) {
+          accommodations[index].images = List.from(accommodations[index].images)
+            ..add(downloadUrl);
+          notifyListeners();
+        }
+        return true;
+      } else {
+        print("Ошибка ImgBB: ${response.body}");
+        return false;
+      }
+    } catch (e) {
+      print("Ошибка при выполнении запроса: $e");
+      return false;
+    }
+  }
+
+  // --- НОВЫЙ МЕТОД ДЛЯ УДАЛЕНИЯ ФОТО ---
+  Future<void> deletePhotoFromAccommodation(
+    String itemId,
+    String photoUrl,
+  ) async {
+    try {
+      // 1. Удаляем ссылку из массива в облаке Firestore
+      await FirebaseFirestore.instance
+          .collection('${prefix}accommodations')
+          .doc(itemId)
+          .update({
+            'images': FieldValue.arrayRemove([photoUrl]),
+          });
+
+      // 2. Удаляем ссылку из локального списка, чтобы экран обновился мгновенно
+      final index = accommodations.indexWhere((a) => a.id == itemId);
+      if (index != -1) {
+        accommodations[index].images.remove(photoUrl);
+        notifyListeners();
+      }
+    } catch (e) {
+      print("Ошибка удаления фото: $e");
+    }
+  }
+}
+
+class AccommodationImageSlider extends StatefulWidget {
+  final BookingItem item;
+
+  const AccommodationImageSlider({super.key, required this.item});
+
+  @override
+  State<AccommodationImageSlider> createState() =>
+      _AccommodationImageSliderState();
+}
+
+class _AccommodationImageSliderState extends State<AccommodationImageSlider> {
+  final PageController _pageController = PageController();
+  int _currentPage = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    // Собираем все фото вместе (главное + дополнительные)
+    List<String> allPhotos = [];
+    if (widget.item.image.isNotEmpty) allPhotos.add(widget.item.image);
+    allPhotos.addAll(widget.item.images);
+
+    // Если фоток вообще нет, показываем заглушку
+    if (allPhotos.isEmpty) {
+      return Container(
+        height: 350,
+        color: Colors.grey[300],
+        child: const Icon(Icons.image_not_supported, size: 50),
+      );
+    }
+
+    return SizedBox(
+      height: 350,
+      child: Stack(
+        children: [
+          PageView.builder(
+            controller: _pageController,
+            onPageChanged: (index) => setState(() => _currentPage = index),
+            itemCount: allPhotos.length,
+            itemBuilder: (context, index) {
+              return Image.network(
+                allPhotos[index],
+                fit: BoxFit.cover,
+                width: double.infinity,
+                errorBuilder: (ctx, err, stack) => Container(
+                  color: Colors.grey[200],
+                  child: const Icon(Icons.broken_image),
+                ),
+              );
+            },
+          ),
+
+          // Стрелки (показываем только если фото больше 1)
+          if (allPhotos.length > 1) ...[
+            Positioned(
+              left: 10,
+              top: 0,
+              bottom: 0,
+              child: IconButton(
+                icon: const Icon(
+                  Icons.arrow_back_ios,
+                  color: Colors.white,
+                  shadows: [Shadow(blurRadius: 5)],
+                ),
+                onPressed: () => _pageController.previousPage(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeInOut,
+                ),
+              ),
+            ),
+            Positioned(
+              right: 10,
+              top: 0,
+              bottom: 0,
+              child: IconButton(
+                icon: const Icon(
+                  Icons.arrow_forward_ios,
+                  color: Colors.white,
+                  shadows: [Shadow(blurRadius: 5)],
+                ),
+                onPressed: () => _pageController.nextPage(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeInOut,
+                ),
+              ),
+            ),
+            // Индикатор страниц (точки внизу)
+            Positioned(
+              bottom: 10,
+              left: 0,
+              right: 0,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(
+                  allPhotos.length,
+                  (index) => Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 3),
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _currentPage == index
+                          ? Colors.white
+                          : Colors.white70,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+// -----------------------------------------------------------------------------
+// 3. ОСНОВНОЙ ВИДЖЕТ ПРИЛОЖЕНИЯ
+// -----------------------------------------------------------------------------
+
+class AltaiBaseApp extends StatelessWidget {
+  const AltaiBaseApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Алтай База',
+      debugShowCheckedModeBanner: false,
+      // --- ДОБАВЬ ЭТИ ТРИ ПАРАМЕТРА НИЖЕ ---
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: const [Locale('ru')],
+      locale: const Locale('ru'),
+      // ------------------------------------
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF2E7D32),
+          secondary: const Color(0xFF546E7A),
+          surface: const Color(0xFFF1F8E9),
+        ),
+      ),
+      home: const RoleSelectionScreen(),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// ВИДЖЕТ ФОНА (Тот самый, который потерялся)
+// -----------------------------------------------------------------------------
+class GradientBackground extends StatelessWidget {
+  final Widget child;
+
+  const GradientBackground({super.key, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          // 1. ФОТОГРАФИЯ ЛЕСА
+          Positioned.fill(
+            child: Image.asset(
+              'assets/images/forest_bg.jpg',
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) =>
+                  Container(color: Colors.green.shade900),
+            ),
+          ),
+          // 2. ЗАТЕМНЕНИЕ
+          Positioned.fill(
+            child: Container(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.black.withOpacity(0.6),
+                    Colors.black.withOpacity(0.4),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          // 3. КОНТЕНТ
+          SafeArea(child: child),
+        ],
+      ),
+    );
+  }
+}
+
+// 4. ЭКРАН ВЫБОРА РОЛИ
+// -----------------------------------------------------------------------------
+
+// 4. ЭКРАН ВЫБОРА РОЛИ
+// -----------------------------------------------------------------------------
+
+class RoleSelectionScreen extends StatefulWidget {
+  const RoleSelectionScreen({super.key});
+
+  @override
+  State<RoleSelectionScreen> createState() => _RoleSelectionScreenState();
+}
+
+class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
+  @override
+  void initState() {
+    super.initState();
+    // Запускаем проверку обновлений сразу после того, как нарисуется экран
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkForUpdates(context);
+    });
+  }
+
+  // Вспомогательная функция для прямого скачивания с Яндекс.Диска
+  Future<void> _startDirectDownload(BuildContext context, String yandexDiskUrl) async {
+    // Показываем крутилку загрузки, чтобы турист понял, что процесс пошел
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator(color: Colors.green)),
+    );
+
+    try {
+      // Магия: просим у Яндекса ПРЯМАЮ ссылку на скачивание файла
+      final apiUrl = 'https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=$yandexDiskUrl';
+      final response = await http.get(Uri.parse(apiUrl));
+
+      if (!context.mounted) return;
+      Navigator.pop(context); // Убираем крутилку загрузки
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final directUrl = data['href']; // Вот она, чистая ссылка на .apk!
+
+        // Телефон мгновенно начнет скачивание файла без открытия сайтов
+        await launchUrl(Uri.parse(directUrl), mode: LaunchMode.externalApplication);
+      } else {
+        // План Б: если Яндекс тупит, открываем по старинке
+        await launchUrl(Uri.parse(yandexDiskUrl), mode: LaunchMode.externalApplication);
+      }
+    } catch (e) {
+      if (!context.mounted) return;
+      Navigator.pop(context);
+      await launchUrl(Uri.parse(yandexDiskUrl), mode: LaunchMode.externalApplication);
+    }
+  }
+
+  Future<void> _checkForUpdates(BuildContext context) async {
+    // 1. ИГНОРИРУЕМ ВЕБ-ВЕРСИЮ: Если приложение запущено в браузере (PWA, iPhone, Telegram),
+    // просто прерываем проверку. Им ничего скачивать не нужно.
+    if (kIsWeb) return;
+
+    try {
+      // 2. Узнаем текущую версию установленного приложения
+      PackageInfo packageInfo = await PackageInfo.fromPlatform();
+      String currentVersion = packageInfo.version
+          .trim(); // Убираем случайные пробелы
+
+      // 3. Спрашиваем Firebase.
+      // ВАЖНО: GetOptions(source: Source.server) заставляет код игнорировать
+      // старый кэш телефона и брать только свежую версию из облака!
+      var doc = await FirebaseFirestore.instance
+          .collection('app_config')
+          .doc('settings')
+          .get(const GetOptions(source: Source.server));
+
+      if (doc.exists) {
+        String latestVersion = (doc.data()?['latest_version'] ?? currentVersion)
+            .toString()
+            .trim();
+        String updateUrl = doc.data()?['update_url'] ?? '';
+
+        // 4. Если версии не совпадают — показываем окно
+        if (currentVersion != latestVersion && updateUrl.isNotEmpty) {
+          if (!mounted) return;
+          showDialog(
+            context: context,
+            barrierDismissible: false, // Запрещаем закрывать окно кликом мимо
+            builder: (context) => AlertDialog(
+              title: const Text('Доступно обновление! 🚀'),
+              content: Text(
+                'Вышла новая версия Сказки Алтая ($latestVersion).\nПожалуйста, обновите приложение для стабильной работы.',
+              ),
+              actions: [
+                // Кнопка "СКАЧАТЬ"
+                ElevatedButton(
+                  onPressed: () {
+                    // Вызываем нашу новую функцию для прямого скачивания
+                    _startDirectDownload(context, updateUrl);
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                  ),
+                  child: const Text(
+                    'СКАЧАТЬ',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ),
+                // ДОБАВЛЕНО: Кнопка "Позже" на всякий случай, чтобы приложение
+                // не блокировалось намертво, если вдруг что-то пойдет не так
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text(
+                    'Позже',
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Ошибка проверки обновлений: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: GradientBackground(
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              TweenAnimationBuilder<double>(
+                tween: Tween<double>(begin: 0.01, end: 1.0),
+                duration: const Duration(seconds: 2),
+                curve: Curves.elasticOut,
+                builder: (context, value, child) {
+                  return Opacity(
+                    opacity: value.clamp(0.0, 1.0),
+                    child: Transform.scale(
+                      scale: value,
+                      child: Image.asset(
+                        'assets/images/logo.jpg',
+                        height: 300,
+                        width: 300,
+                        fit: BoxFit.contain,
+                        errorBuilder: (context, error, stackTrace) =>
+                            const Icon(
+                              Icons.cabin,
+                              size: 80,
+                              color: Color(0xFF2E7D32),
+                            ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(height: 20),
+              const Text(
+                'ДОБРО ПОЖАЛОВАТЬ',
+                style: TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              const Text(
+                'База отдыха Сказка',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.white70,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+              const SizedBox(height: 50),
+              SizedBox(
+                width: 250,
+                height: 50,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const TouristHomeScreen(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.person),
+                  label: const Text('Я Турист'),
+                ),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: 250,
+                height: 50,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Colors.white, width: 2),
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const AdminLoginScreen(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.admin_panel_settings),
+                  label: const Text('Администратор'),
+                ),
+              ),
+              const SizedBox(height: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 5. РЕЖИМ ТУРИСТА
+// -----------------------------------------------------------------------------
+
+class TouristHomeScreen extends StatefulWidget {
+  const TouristHomeScreen({super.key});
+
+  @override
+  State<TouristHomeScreen> createState() => _TouristHomeScreenState();
+}
+
+class _TouristHomeScreenState extends State<TouristHomeScreen>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  Future<void> _contactAdmin() async {
+    final Uri url = Uri.parse('https://t.me/Ysadba_Skazka04');
+    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Не удалось открыть Telegram')),
+        );
+      }
+    }
+  }
+
+  // --- НОВАЯ ФУНКЦИЯ ДЛЯ ОТКРЫТИЯ КАРТ ---
+  Future<void> _openMap() async {
+    const double latitude = 50.171020;
+    const double longitude = 85.971791;
+
+    // Универсальные ссылки для разных карт
+    final Uri googleMapsUrl = Uri.parse(
+      "https://maps.google.com/maps?q=$latitude,$longitude",
+    );
+    final Uri appleMapsUrl = Uri.parse(
+      "https://maps.apple.com/?q=$latitude,$longitude",
+    );
+
+    if (await canLaunchUrl(googleMapsUrl)) {
+      await launchUrl(googleMapsUrl, mode: LaunchMode.externalApplication);
+    } else if (await canLaunchUrl(appleMapsUrl)) {
+      await launchUrl(appleMapsUrl, mode: LaunchMode.externalApplication);
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Не удалось открыть приложение карт')),
+        );
+      }
+    }
+  }
+
+  void _showInfoDialog(String title, String content, IconData icon) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            Icon(icon, color: Colors.green.shade700),
+            const SizedBox(width: 10),
+            Expanded(child: Text(title, style: const TextStyle(fontSize: 18))),
+          ],
+        ),
+        content: Text(content, style: const TextStyle(height: 1.5)),
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Понятно', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActiveTicket(DataBaseProvider provider) {
+    final now = DateTime.now();
+    // Ищем ближайшую будущую бронь, НО ТОЛЬКО СОЗДАННУЮ С ЭТОГО ТЕЛЕФОНА
+    final upcoming = provider.transactions
+        .where((t) =>
+    (t.startDate.isAfter(now) || t.startDate.isAtSameMomentAs(now)) &&
+        t.userId == provider.currentUserId &&
+        provider.currentUserId.isNotEmpty
+    ).toList();
+    upcoming.sort((a, b) => a.startDate.compareTo(b.startDate));
+
+    if (upcoming.isEmpty)
+      return const SizedBox.shrink(); // Если броней нет, прячем билет
+
+    final myBooking = upcoming.first;
+    final daysLeft = myBooking.startDate.difference(now).inDays;
+    final itemName = provider.accommodations
+        .firstWhere(
+          (a) => a.id == myBooking.itemId,
+          orElse: () => BookingItem(
+            id: '',
+            title: 'Домик',
+            price: 0,
+            type: ItemType.accommodation,
+          ),
+        )
+        .title;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 25),
+      elevation: 8,
+      shadowColor: Colors.green.withOpacity(0.3),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Colors.green.shade50, Colors.white],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.green.shade200, width: 2),
+        ),
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade700,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Text(
+                      'ВАШ БИЛЕТ',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    itemName,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '${DateFormat('dd.MM').format(myBooking.startDate)} - ${DateFormat('dd.MM').format(myBooking.endDate)}',
+                    style: TextStyle(
+                      color: Colors.grey.shade700,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    daysLeft == 0
+                        ? 'Заезд уже сегодня!'
+                        : 'До отдыха: $daysLeft дней',
+                    style: TextStyle(
+                      color: Colors.orange.shade800,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                    ),
+                  ),
+
+                  // --- НОВАЯ КНОПКА МАРШРУТА В БИЛЕТЕ ---
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: _openMap,
+                    icon: const Icon(Icons.near_me, size: 16),
+                    label: const Text(
+                      'Маршрут',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.green.shade700,
+                      side: BorderSide(color: Colors.green.shade700),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 0,
+                      ),
+                      minimumSize: const Size(
+                        0,
+                        32,
+                      ), // Делаем кнопку компактной
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            // Декоративный QR-код
+            Container(
+              width: 80,
+              height: 80,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.grey.shade300),
+              ),
+              child: const Icon(
+                Icons.qr_code_2,
+                size: 65,
+                color: Colors.black87,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --- ОБНОВЛЕННЫЕ КНОПКИ СОЦСЕТЕЙ ---
+  Widget _buildSocialLinks() {
+    // Вспомогательная функция для открытия ссылок
+    Future<void> _launchSocial(String url) async {
+      final Uri uri = Uri.parse(url);
+      if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Не удалось открыть ссылку: $url')),
+          );
+        }
+      }
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 20),
+      child: Column(
+        children: [
+          const Text(
+            'Подписывайтесь и следите за информацией!',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 15),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Кнопка Instagram
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.purple.shade600,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(15),
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                ),
+                onPressed: () => _launchSocial(
+                  'https://www.instagram.com/gostevoi_dom.skazka?igsh=MWtydWhnM2xtejJtdw==',
+                ),
+                icon: const Icon(Icons.camera_alt),
+                label: const Text(
+                  'Instagram',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+              const SizedBox(width: 15),
+              // Кнопка ВКонтакте
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.blue.shade700,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(15),
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                ),
+                onPressed: () => _launchSocial('https://vk.com/zamultaskazka'),
+                icon: const Icon(Icons.group),
+                label: const Text(
+                  'ВКонтакте',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Сказка Алтая',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        centerTitle: true,
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: Colors.green.shade800,
+          indicatorWeight: 3,
+          labelStyle: const TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+          ),
+          tabs: const [
+            Tab(text: 'Жильё', icon: Icon(Icons.holiday_village)),
+            Tab(text: 'Услуги', icon: Icon(Icons.explore)),
+          ],
+        ),
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _contactAdmin,
+        backgroundColor: Colors.green.shade700,
+        icon: const Icon(Icons.support_agent, color: Colors.white),
+        label: const Text(
+          'Связаться',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+      ),
+      body: GradientBackground(
+        child: TabBarView(
+          controller: _tabController,
+          children: [
+            // --- ВКЛАДКА ЖИЛЬЯ ---
+            ListView(
+              padding: const EdgeInsets.all(15),
+              physics: const BouncingScrollPhysics(),
+              children: [
+                _buildActiveTicket(provider),
+                const SizedBox(height: 25),
+
+                // 3. Инфо-кнопки (FAQ)
+                SizedBox(
+                  height: 45,
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    physics: const BouncingScrollPhysics(),
+                    children: [
+                      // --- ОБНОВЛЕНО: Передаем функцию _openMap в кнопку ---
+                      _buildInfoChip(
+                        '📍 Как доехать',
+                        Icons.map,
+                        '',
+                        onAction: _openMap,
+                      ),
+                      const SizedBox(width: 10),
+                      _buildInfoChip(
+                        '📜 Правила',
+                        Icons.menu_book,
+                        'Заезд после 14:00, выезд до 12:00.\nСоблюдайте режим тишины после 23:00.\nКурение в домиках строго запрещено.',
+                      ),
+                      const SizedBox(width: 10),
+                      _buildInfoChip(
+                        '📶 Wi-Fi',
+                        Icons.wifi,
+                        'На территории базы работает бесплатный Wi-Fi. Пароль вы найдете в своем домике на информационной табличке.',
+                      ),
+                      const SizedBox(width: 10),
+                      _buildInfoChip(
+                        '🐶 Питомцы',
+                        Icons.pets,
+                        'Мы очень любим животных, но проживание с питомцами требует предварительного согласования с администратором.',
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 25),
+                const Padding(
+                  padding: EdgeInsets.only(left: 4, bottom: 15),
+                  child: Text(
+                    'Выберите домик:',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+
+                // 4. Список домиков
+                // 4. Список домиков (Скрываем виртуальные комбо-объекты)
+                ...provider.accommodations
+                    .where((item) => item.id != 'combo_base' && item.id != 'combo_teremok')
+                    .map((item) => AccommodationCard(item: item))
+                    .toList(),
+
+                // 5. Кнопки соцсетей в самом низу
+                _buildSocialLinks(),
+                const SizedBox(height: 80),
+              ],
+            ),
+
+            // --- ВКЛАДКА УСЛУГ ---
+            ListView.builder(
+              padding: const EdgeInsets.only(
+                top: 15,
+                left: 15,
+                right: 15,
+                bottom: 80,
+              ),
+              physics: const BouncingScrollPhysics(),
+              itemCount: provider.services.length,
+              itemBuilder: (context, index) {
+                final item = provider.services[index];
+                IconData serviceIcon = Icons.explore;
+                if (item.title.toLowerCase().contains('баня'))
+                  serviceIcon = Icons.hot_tub;
+                if (item.title.toLowerCase().contains('кони'))
+                  serviceIcon = Icons.pets;
+
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 15),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.95),
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.1),
+                        blurRadius: 10,
+                        offset: const Offset(0, 5),
+                      ),
+                    ],
+                  ),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 15,
+                    ),
+                    leading: Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withOpacity(0.1),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        serviceIcon,
+                        color: const Color(0xFF2E7D32),
+                        size: 30,
+                      ),
+                    ),
+                    title: Text(
+                      item.title,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 18,
+                      ),
+                    ),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 6.0),
+                      child: Text(
+                        item.description,
+                        style: TextStyle(color: Colors.grey.shade700),
+                      ),
+                    ),
+                    trailing: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Text(
+                          '${item.price} ₽',
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF2E7D32),
+                          ),
+                        ),
+                        Text(
+                          'за ${item.unit}',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --- ОБНОВЛЕНО: Добавлен параметр onAction ---
+  Widget _buildInfoChip(
+    String label,
+    IconData icon,
+    String content, {
+    VoidCallback? onAction,
+  }) {
+    return ActionChip(
+      elevation: 2,
+      pressElevation: 6,
+      backgroundColor: Colors.white.withOpacity(0.95),
+      side: BorderSide.none,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      avatar: Icon(icon, size: 18, color: Colors.green.shade700),
+      label: Text(
+        label,
+        style: const TextStyle(
+          fontWeight: FontWeight.bold,
+          color: Colors.black87,
+        ),
+      ),
+      // Если передали onAction (как в случае с картой) - выполняем его, иначе открываем стандартное окно
+      onPressed: onAction ?? () => _showInfoDialog(label, content, icon),
+    );
+  }
+} // Конец класса
+
+class AccommodationCard extends StatelessWidget {
+  final BookingItem item;
+
+  const AccommodationCard({super.key, required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 6,
+      shadowColor: Colors.black.withOpacity(0.4),
+      margin: const EdgeInsets.only(bottom: 20),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      // Более круглые углы
+      clipBehavior: Clip.antiAlias,
+      // Чтобы фото не вылезало за круглые углы
+      child: Container(
+        decoration: const BoxDecoration(color: Colors.white),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Карусель фотографий
+            AccommodationImageSlider(item: item),
+
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Название
+                  Text(
+                    item.title,
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Описание
+                  Text(
+                    item.description.isNotEmpty
+                        ? item.description
+                        : 'Уютный домик для вашего отдыха...',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.grey.shade800,
+                      height: 1.4,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Иконки удобств в красивых плашках
+                  Row(
+                    children: [
+                      _buildFeatureBadge(Icons.wifi, 'Wi-Fi'),
+                      const SizedBox(width: 8),
+                      _buildFeatureBadge(Icons.hot_tub, 'Баня рядом'),
+                      const SizedBox(width: 8),
+                      _buildFeatureBadge(Icons.ac_unit, 'Отопление'),
+                    ],
+                  ),
+                  const Divider(
+                    height: 30,
+                    thickness: 1,
+                    color: Colors.black12,
+                  ),
+
+                  // НИЖНЯЯ ПАНЕЛЬ: Цена и Кнопка "Забронировать"
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Стоимость',
+                            style: TextStyle(fontSize: 12, color: Colors.grey),
+                          ),
+                          Text(
+                            '${item.price} ₽',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.green.shade700,
+                            ),
+                          ),
+                          Text(
+                            'за ${item.unit}',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey,
+                            ),
+                          ),
+                        ],
+                      ),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green.shade600,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 24,
+                            vertical: 12,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          elevation: 3,
+                        ),
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (ctx) =>
+                                BookingDialog(item: item, isAdmin: false),
+                          );
+                        },
+                        child: const Row(
+                          children: [
+                            Text(
+                              'Забронировать',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                            SizedBox(width: 5),
+                            Icon(Icons.arrow_forward_ios, size: 14),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Виджет для иконок удобств (Стиль "таблетки")
+  Widget _buildFeatureBadge(IconData icon, String label) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.green.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.green.shade200),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: Colors.green.shade800),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              color: Colors.green.shade900,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class BookingDialog extends StatefulWidget {
+  final BookingItem? item; // Добавили знак вопроса
+  final bool isAdmin;
+
+  const BookingDialog({
+    super.key,
+    this.item, // Убрали required
+    this.isAdmin = false,
+  });
+
+  @override
+  State<BookingDialog> createState() => _BookingDialogState();
+}
+
+class _BookingDialogState extends State<BookingDialog> {
+  final _nameController = TextEditingController();
+  final _phoneController = TextEditingController();
+
+  // Переменные для управления выбором
+  BookingItem? _selectedItem;
+  DateTimeRange? _selectedDateRange;
+  int _totalPrice = 0;
+
+  Future<void> _launchURL(String urlString) async {
+    final Uri url = Uri.parse(urlString);
+    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
+      throw Exception('Не удалось открыть ссылку $urlString');
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedItem = widget.item;
+    // Если айтем есть — ставим его цену, если нет (нажали плюс) — ставим 0
+    _totalPrice = _selectedItem?.price ?? 0;
+  }
+
+  // Функция пересчета цены
+  void _calculatePrice() {
+    // Выбираем: либо то, что выбрали в списке, либо то, что пришло изначально
+    final currentItem = _selectedItem ?? widget.item;
+
+    if (_selectedDateRange != null && currentItem != null) {
+      int days = _selectedDateRange!.duration.inDays;
+      if (days == 0) days = 1;
+
+      setState(() {
+        _totalPrice = currentItem.price * days;
+      });
+    }
+  }
+
+  bool _isDayBlocked(DateTime day) {
+    final provider = Provider.of<DataBaseProvider>(context, listen: false);
+    if (_selectedItem == null) return false;
+
+    // Считаем, сколько броней уже есть на этот КОНКРЕТНЫЙ ID объекта
+    final existingBookingsCount = provider.transactions.where((t) {
+      if (t.itemId != _selectedItem!.id) return false;
+
+      final start = DateTime(t.startDate.year, t.startDate.month, t.startDate.day);
+      final end = DateTime(t.endDate.year, t.endDate.month, t.endDate.day);
+      final check = DateTime(day.year, day.month, day.day);
+
+      // Проверяем занятость ночи
+      return (check.isAtSameMomentAs(start) || (check.isAfter(start) && check.isBefore(end)));
+    }).length;
+
+    // Сравниваем с лимитом объекта (для Верхнего/Нижнего это будет 2)
+    return existingBookingsCount >= _selectedItem!.capacity;
+  }
+
+  void _pickDateRange() async {
+    final provider = Provider.of<DataBaseProvider>(context, listen: false);
+    final now = DateTime.now();
+
+    // 1. ИСПРАВЛЕНИЕ: Берем объект из выпадающего списка (если он выбран),
+    // либо изначальный объект. Это убирает ошибку "Сначала выберите объект".
+    final currentItem = _selectedItem ?? widget.item;
+
+    if (currentItem == null || currentItem.id == 'manual') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Сначала выберите домик или услугу!')),
+      );
+      return;
+    }
+
+    final newDateRange = await showDateRangePicker(
+      context: context,
+      firstDate: now,
+      lastDate: DateTime(now.year + 1),
+      initialDateRange: _selectedDateRange,
+
+      // 2. ИСПРАВЛЕНИЕ КАЛЕНДАРЯ: Предикат должен принимать ровно ОДИН параметр (day).
+      selectableDayPredicate: (DateTime day, DateTime? startRange, DateTime? endRange) {
+        if (provider.seasonStart != null && provider.seasonEnd != null) {
+          DateTime checkDay = DateTime(day.year, day.month, day.day);
+          DateTime sStart = DateTime(provider.seasonStart!.year, provider.seasonStart!.month, provider.seasonStart!.day);
+          DateTime sEnd = DateTime(provider.seasonEnd!.year, provider.seasonEnd!.month, provider.seasonEnd!.day);
+
+          if (checkDay.isBefore(sStart) || checkDay.isAfter(sEnd)) return false;
+        }
+
+        if (currentItem.type != ItemType.accommodation) return true;
+        DateTime checkDay = DateTime(day.year, day.month, day.day);
+
+        for (var t in provider.transactions) {
+          DateTime startT = DateTime(t.startDate.year, t.startDate.month, t.startDate.day);
+          DateTime endT = DateTime(t.endDate.year, t.endDate.month, t.endDate.day);
+
+          // ⚠️ ГЛАВНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ:
+          // Убрали checkDay.isAtSameMomentAs(startT).
+          // День заезда (startT) остается кликабельным, чтобы служить днем выезда для других!
+          if (checkDay.isAfter(startT) && checkDay.isBefore(endT)) {
+
+            // --- ЛОГИКА ВЗАИМОСВЯЗЕЙ ---
+            if (t.itemId == 'combo_base') return false;
+            if (currentItem.id == 'combo_base') return false;
+
+            if (t.itemId == 'combo_teremok') {
+              if (currentItem.id == 'combo_teremok') return false;
+              if (currentItem.title.toLowerCase().contains('теремок')) return false;
+            }
+
+            if (currentItem.id == 'combo_teremok') {
+              bool isAnyRoomInTeremokBooked = provider.accommodations.any((a) => a.id == t.itemId && a.title.toLowerCase().contains('теремок'));
+              if (isAnyRoomInTeremokBooked) return false;
+            }
+
+            if (t.itemId == currentItem.id) return false;
+          }
+        }
+        return true;
+      },
+
+      // 3. ИСПРАВЛЕНИЕ ЦВЕТА: Красим занятые (заблокированные) даты в красный
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            datePickerTheme: DatePickerThemeData(
+              // 1. Делаем сам текст белым на красном фоне
+              dayForegroundColor: WidgetStateProperty.resolveWith((states) {
+                if (states.contains(WidgetState.disabled)) return Colors.white;
+                return Colors.black87;
+              }),
+              // 2. ЗАЛИВАЕМ ФОН ЗАНЯТЫХ ДАТ КРАСНЫМ
+              dayBackgroundColor: WidgetStateProperty.resolveWith((states) {
+                if (states.contains(WidgetState.disabled))
+                  return Colors.red.shade400;
+                return null;
+              }),
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (newDateRange != null) {
+      bool hasOverlap = false;
+      DateTime current = newDateRange.start;
+      // Создаем отдельную переменную для конца проверки
+      DateTime endRange = newDateRange.end;
+
+      // --- ИСПРАВЛЕНИЕ: Если выбрали одни сутки (с 17 по 17) ---
+      // Добавляем 1 день, чтобы цикл обязательно проверил эту ночь!
+      if (current.isAtSameMomentAs(endRange)) {
+        endRange = endRange.add(const Duration(days: 1));
+      }
+
+      // Проверяем каждую ночь в выбранном диапазоне
+      while (current.isBefore(endRange)) {
+        DateTime checkDay = DateTime(current.year, current.month, current.day);
+
+        for (var t in provider.transactions) {
+          DateTime startT = DateTime(t.startDate.year, t.startDate.month, t.startDate.day);
+          DateTime endT = DateTime(t.endDate.year, t.endDate.month, t.endDate.day);
+
+          // Проверяем занята ли эта ночь (включая день заезда, но не включая день выезда)
+          if ((checkDay.isAtSameMomentAs(startT) || checkDay.isAfter(startT)) && checkDay.isBefore(endT)) {
+
+            if (t.itemId == 'combo_base' || currentItem.id == 'combo_base') {
+              hasOverlap = true; break;
+            }
+            if (t.itemId == 'combo_teremok' && (currentItem.id == 'combo_teremok' || currentItem.title.toLowerCase().contains('теремок'))) {
+              hasOverlap = true; break;
+            }
+            if (currentItem.id == 'combo_teremok' && t.itemId != 'combo_teremok' && provider.accommodations.any((a) => a.id == t.itemId && a.title.toLowerCase().contains('теремок'))) {
+              hasOverlap = true; break;
+            }
+            if (t.itemId == currentItem.id) {
+              hasOverlap = true; break;
+            }
+          }
+        }
+        if (hasOverlap) break;
+        current = current.add(const Duration(days: 1));
+      }
+
+      // Если нашли пересечение — выдаем ошибку и отменяем выбор
+      if (hasOverlap) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Выбранные даты пересекаются с другой бронью! Выберите свободные дни.'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 4),
+          ),
+        );
+        return; // 🔴 Бронь не проходит дальше
+      }
+
+      // Если всё свободно, сохраняем выбор и считаем цену
+      setState(() {
+        _selectedDateRange = newDateRange;
+      });
+      _calculatePrice();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context, listen: false);
+    // Список всех доступных объектов (Избушки и Теремки)
+    final allItems = [...provider.accommodations, ...provider.services];
+
+    return AlertDialog(
+      title: Text(
+        (widget.item == null)
+            ? 'Новая бронь'
+            : 'Бронь: ${widget.item?.title ?? ""}',
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // ВЫБОР ОБЪЕКТА (появляется только если нажали на Плюс)
+            if (widget.item?.id == 'manual' || widget.item == null) ...[
+              const Text(
+                'Что бронируем?',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              DropdownButton<BookingItem>(
+                isExpanded: true,
+                value: _selectedItem?.id == 'manual' ? null : _selectedItem,
+                hint: const Text('Выберите домик'),
+                items: allItems.map((item) {
+                  return DropdownMenuItem(
+                    value: item,
+                    child: Text('${item.title} (${item.price}₽)'),
+                  );
+                }).toList(),
+                onChanged: (val) {
+                  setState(() {
+                    _selectedItem = val;
+                  });
+                  _calculatePrice();
+                },
+              ),
+              const SizedBox(height: 15),
+            ],
+
+            TextField(
+              controller: _nameController,
+              decoration: const InputDecoration(labelText: 'Имя клиента'),
+            ),
+            TextField(
+              controller: _phoneController, // Твое правильное имя контроллера
+              keyboardType: TextInputType.phone,
+              decoration: const InputDecoration(
+                labelText: 'Номер телефона',
+                hintText: '89991234567',
+                prefixIcon: Icon(Icons.phone),
+                border: OutlineInputBorder(),
+              ),
+              inputFormatters: [
+                // Разрешаем только цифры
+                FilteringTextInputFormatter.digitsOnly,
+                // Ограничиваем длину до 11 знаков
+                LengthLimitingTextInputFormatter(11),
+              ],
+            ),
+
+            ElevatedButton.icon(
+              onPressed: _pickDateRange,
+              icon: const Icon(Icons.date_range),
+              label: Text(
+                _selectedDateRange == null
+                    ? 'Выбрать даты'
+                    : '${DateFormat('dd.MM').format(_selectedDateRange!.start)} - ${DateFormat('dd.MM').format(_selectedDateRange!.end)}',
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              'Итого: $_totalPrice ₽',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Отмена'),
+        ),
+        ElevatedButton(
+          onPressed: () async {
+            // ДОБАВИЛИ async
+            final currentItem = _selectedItem;
+
+            if (_nameController.text.isEmpty ||
+                _selectedDateRange == null ||
+                currentItem == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Заполните имя, выберите объект и даты!'),
+                ),
+              );
+              return;
+            }
+
+            final booking = Booking(
+              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              customerName: _nameController.text,
+              customerPhone: _phoneController.text,
+              item: currentItem,
+              startDate: _selectedDateRange!.start,
+              endDate: _selectedDateRange!.end,
+              totalPrice: _totalPrice,
+              prepayment: (_totalPrice / 2).round(),
+              isConfirmed: widget.isAdmin,
+              userId: provider.currentUserId, // <--- ПРИКРЕПЛЯЕМ ID
+            );
+
+            // ЖДЕМ РЕЗУЛЬТАТА ТРАНЗАКЦИИ
+            bool success = await provider.addBooking(booking);
+
+            if (!success) {
+              // Если вернулось false, значит кто-то успел быстрее
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Извините, эти даты только что забронировали! Выберите другие.',
+                    ),
+                    backgroundColor: Colors.red,
+                    duration: Duration(seconds: 4),
+                  ),
+                );
+              }
+              return; // Останавливаем выполнение, окно не закрываем
+            }
+
+            // ЕСЛИ ВСЁ ОК — идем дальше
+
+            provider.sendTelegramMessage(
+              '🌲 *Новая бронь!*\n\n'
+              '🏠 *Объект:* ${booking.item.title}\n'
+              '👤 *Клиент:* ${booking.customerName}\n'
+              '📞 *Тел:* ${booking.customerPhone}\n'
+              '💰 *Сумма:* ${booking.totalPrice} ₽',
+            );
+
+            if (widget.isAdmin) {
+              if (mounted) Navigator.pop(context);
+              return;
+            }
+
+            if (mounted) {
+              // Закрываем окно бронирования
+              Navigator.pop(context);
+
+              // Показываем окно успешной заявки
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Заявка принята!'),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text(
+                        'Для подтверждения и внесения предоплаты свяжитесь с нами:',
+                      ),
+                      const SizedBox(height: 15),
+                      ElevatedButton.icon(
+                        onPressed: () =>
+                            _launchURL('https://t.me/Ysadba_Skazka04'),
+                        icon: const Icon(Icons.send),
+                        label: const Text('Написать в Telegram'),
+                      ),
+                      const SizedBox(height: 10),
+                      TextButton.icon(
+                        onPressed: () => _launchURL('tel:+79833937671'),
+                        icon: const Icon(Icons.phone),
+                        label: const Text('+7 983 393 76 71'),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: () =>
+                            _launchURL('https://t.me/Ysadba_Skazka04'),
+                        icon: const Icon(Icons.send),
+                        label: const Text('Написать в Telegram'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _launchURL('tel:+79136976436'),
+                        icon: const Icon(Icons.phone),
+                        label: const Text('+7 913 697 64 36'),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: () =>
+                            _launchURL('https://t.me/Ysadba_Skazka04'),
+                        icon: const Icon(Icons.send),
+                        label: const Text('Написать в Telegram'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _launchURL('tel:+79136953537'),
+                        icon: const Icon(Icons.phone),
+                        label: const Text('+7 913 695 35 37'),
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('ОК'),
+                    ),
+                  ],
+                ),
+              );
+            }
+          },
+          child: const Text('Сохранить'),
+        ),
+      ],
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 6. РЕЖИМ АДМИНИСТРАТОРА
+// -----------------------------------------------------------------------------
+
+class AdminLoginScreen extends StatefulWidget {
+  const AdminLoginScreen({super.key});
+
+  @override
+  State<AdminLoginScreen> createState() => _AdminLoginScreenState();
+}
+
+class _AdminLoginScreenState extends State<AdminLoginScreen> {
+  final _pinController = TextEditingController();
+
+  void _checkPin() {
+    if (_pinController.text == '02042026') {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => const AdminDashboardScreen()),
+      );
+    } else {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Неверный код')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Вход для персонала')),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(30.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Text('Введите PIN-код'),
+              TextField(
+                controller: _pinController,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 24, letterSpacing: 5),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton(onPressed: _checkPin, child: const Text('Войти')),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AdminDashboardScreen extends StatelessWidget {
+  const AdminDashboardScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 5, // <--- УВЕЛИЧИЛИ ДО 5
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Администрирование'),
+          backgroundColor: Colors.blueGrey[100],
+          bottom: const TabBar(
+            isScrollable: true,
+            // Позволяет вкладкам прокручиваться, если не влезают
+            tabs: [
+              Tab(text: 'Брони', icon: Icon(Icons.list_alt)),
+              Tab(text: 'Бухгалтер', icon: Icon(Icons.calculate)),
+              Tab(text: 'Отчеты', icon: Icon(Icons.insights)),
+              // <--- НОВАЯ ВКЛАДКА
+              Tab(text: 'Цены', icon: Icon(Icons.edit)),
+              Tab(text: 'Управление', icon: Icon(Icons.settings)),
+            ],
+          ),
+        ),
+        body: const TabBarView(
+          children: [
+            AdminBookingsTab(),
+            AdminAccountingTab(),
+            AdminReportsTab(), // <--- ВЫЗОВ НОВОГО ЭКРАНА
+            AdminPricesTab(),
+            AdminManagementTab(),
+          ],
+        ),
+        floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+        floatingActionButton: FloatingActionButton(
+          onPressed: () {
+            showDialog(
+              context: context,
+              builder: (ctx) => const BookingDialog(item: null, isAdmin: true),
+            );
+          },
+          child: const Icon(Icons.add),
+        ),
+      ),
+    );
+  }
+}
+
+// --- Вкладка Брони ---
+class AdminBookingsTab extends StatelessWidget {
+  const AdminBookingsTab({super.key});
+
+  void _showConfirmDialog(BuildContext context, String docId, String title) {
+    final prepController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Подтвердить: $title'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Введите сумму полученной предоплаты (₽):'),
+            const SizedBox(height: 10),
+            TextField(
+              controller: prepController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                hintText: 'Например: 5000',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Отмена'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final prepAmount = int.tryParse(prepController.text) ?? 0;
+              Provider.of<DataBaseProvider>(
+                context,
+                listen: false,
+              ).confirmBooking(docId, prepAmount);
+              Navigator.pop(ctx);
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+            child: const Text(
+              'Подтвердить',
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 1. СНАЧАЛА получаем доступ к провайдеру!
+    final provider = Provider.of<DataBaseProvider>(context);
+
+    // 2. Теперь используем provider.prefix вместо просто prefix
+    final Stream<QuerySnapshot> _bookingsStream = FirebaseFirestore.instance
+        .collection('${provider.prefix}bookings') // <--- ИСПРАВЛЕНИЕ ЗДЕСЬ
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+
+    return StreamBuilder<QuerySnapshot>(
+      stream: _bookingsStream,
+      builder: (BuildContext context, AsyncSnapshot<QuerySnapshot> snapshot) {
+        // Если произошла ошибка
+        if (snapshot.hasError) {
+          return const Center(child: Text('Что-то пошло не так'));
+        }
+
+        // Пока данные загружаются
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        // Если броней в облаке вообще нет
+        if (snapshot.data!.docs.isEmpty) {
+          return const Center(child: Text('Бронирований в облаке пока нет'));
+        }
+
+        // 2. Если данные есть, строим список
+        // 2. Если данные есть, строим список
+        return ListView(
+          children: snapshot.data!.docs.map((DocumentSnapshot document) {
+            Map<String, dynamic> data =
+                document.data()! as Map<String, dynamic>;
+            String docId = document.id;
+
+            // --- НОВОЕ: Форматируем даты для вывода на экран ---
+            String dateText = "Даты не указаны";
+            if (data['startDate'] != null && data['endDate'] != null) {
+              DateTime sDate = DateTime.parse(data['startDate']);
+              DateTime eDate = DateTime.parse(data['endDate']);
+              dateText =
+                  '${DateFormat('dd.MM.yyyy').format(sDate)} - ${DateFormat('dd.MM.yyyy').format(eDate)}';
+            }
+
+            return Card(
+              margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              child: ListTile(
+                title: Text(
+                  data['itemTitle'] ?? 'Объект не указан',
+                  style: TextStyle(
+                    color: (data['isConfirmed'] ?? false)
+                        ? Colors.green[800]
+                        : Colors.black,
+                  ),
+                ),
+                // --- ИСПРАВЛЕНО: Добавлена строка с датами в начало subtitle ---
+                subtitle: Text(
+                  '🗓 Даты: $dateText\n'
+                  '👤 ${data['customerName']}\n'
+                  '📞 ${data['customerPhone']}\n'
+                  '💰 Итого: ${data['totalPrice']} ₽\n'
+                  '💳 Предоплата: ${data['prepayment'] ?? 0} ₽',
+                  style: const TextStyle(height: 1.4),
+                ),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (!(data['isConfirmed'] ?? false))
+                      IconButton(
+                        icon: const Icon(
+                          Icons.check_circle,
+                          color: Colors.green,
+                        ),
+                        onPressed: () => _showConfirmDialog(
+                          context,
+                          docId,
+                          data['itemTitle'] ?? '',
+                        ),
+                      ),
+                    IconButton(
+                      icon: const Icon(Icons.delete, color: Colors.red),
+                      onPressed: () {
+                        Provider.of<DataBaseProvider>(
+                          context,
+                          listen: false,
+                        ).removeBooking(docId);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+        );
+      },
+    );
+  }
+}
+
+// --- Вкладка Бухгалтерия (ТВОЙ ОРИГИНАЛЬНЫЙ ДИЗАЙН) ---
+class AdminAccountingTab extends StatefulWidget {
+  const AdminAccountingTab({super.key});
+
+  @override
+  State<AdminAccountingTab> createState() => _AdminAccountingTabState();
+}
+
+class _AdminAccountingTabState extends State<AdminAccountingTab> {
+  DateTime _selectedMonth = DateTime.now();
+  final Set<String> _deletedIds = {};
+  final List<String> expenseCategories = [
+    'Продукты',
+    'Зарплата',
+    'Ремонт',
+    'Хозтовары',
+    'Дрова/Уголь',
+    'Налоги',
+    'Прочее',
+  ];
+  final List<String> incomeCategories = [
+    'Проживание',
+    'Экскурсии',
+    'Баня',
+    'Кафе',
+    'Прочее',
+  ];
+
+  Widget _statBlock(String title, String value, Color color) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: TextStyle(
+            color: color,
+            fontSize: 10,
+            fontWeight: FontWeight.w300,
+          ),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: color,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildInnovationDashboard(int income, int expense) {
+    int profit = income - expense;
+    // Считаем эффективность
+    double profitability = (income + expense) == 0
+        ? 0
+        : (profit / (income + expense)).clamp(0.0, 1.0);
+
+    return Container(
+      padding: const EdgeInsets.all(20),
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1B5E20), Color(0xFF4CAF50)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.1),
+            blurRadius: 10,
+            offset: const Offset(0, 5),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _statBlock('ДОХОД', '$income ₽', Colors.white),
+              _statBlock('РАСХОД', '$expense ₽', Colors.white.withOpacity(0.8)),
+              _statBlock('ПРИБЫЛЬ', '$profit ₽', Colors.yellowAccent),
+            ],
+          ),
+          const SizedBox(height: 15),
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Эффективность месяца',
+              style: TextStyle(color: Colors.white70, fontSize: 10),
+            ),
+          ),
+          const SizedBox(height: 4),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: LinearProgressIndicator(
+              value: profitability,
+              minHeight: 6,
+              backgroundColor: Colors.white12,
+              valueColor: const AlwaysStoppedAnimation<Color>(
+                Colors.yellowAccent,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _statTile(String label, int value, Color color) {
+    return Column(
+      children: [
+        Text(label, style: TextStyle(color: color, fontSize: 12)),
+        Text(
+          '$value ₽',
+          style: TextStyle(
+            color: color,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context);
+    final income = provider.calculateMonthlyIncome(_selectedMonth);
+    final expense = provider.calculateMonthlyExpenses(_selectedMonth);
+    final netProfit = provider.calculateNetProfit(_selectedMonth);
+
+    return SingleChildScrollView(
+      child: Padding(
+        padding: const EdgeInsets.all(15.0),
+        child: Column(
+          children: [
+            // 1. Выбор месяца
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: () => setState(
+                    () => _selectedMonth = DateTime(
+                      _selectedMonth.year,
+                      _selectedMonth.month - 1,
+                    ),
+                  ),
+                ),
+                // --- МЕНЯЕМ ОБЫЧНЫЙ ТЕКСТ НА КЛИКАБЕЛЬНУЮ КНОПКУ ---
+                InkWell(
+                  onTap: () {
+                    // При нажатии на месяц открываем календарь
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) =>
+                            MonthAdminView(month: _selectedMonth),
+                      ),
+                    );
+                  },
+                  borderRadius: BorderRadius.circular(10),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 5,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.calendar_month,
+                          color: Colors.blueGrey,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          DateFormat('MMMM yyyy', 'ru').format(_selectedMonth),
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            decoration: TextDecoration.underline,
+                            // Подчеркнем, чтобы было ясно, что кликабельно
+                            decorationStyle: TextDecorationStyle.dashed,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                // ------------------------------------------------
+                IconButton(
+                  icon: const Icon(Icons.arrow_forward),
+                  onPressed: () => setState(
+                    () => _selectedMonth = DateTime(
+                      _selectedMonth.year,
+                      _selectedMonth.month + 1,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(),
+
+            // 2. Диаграмма
+            FinancialPieChart(
+              income: income.toDouble(),
+              expense: expense.toDouble(),
+            ),
+            const SizedBox(height: 10),
+
+            // 3. ТРИ КАРТОЧКИ: Доход, Расход, Итого
+            Row(
+              children: [
+                _statBox('Доходы', '$income ₽', Colors.green),
+                const SizedBox(width: 10),
+                _statBox('Расходы', '$expense ₽', Colors.red),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _statBox(
+              'Чистая прибыль',
+              '$netProfit ₽',
+              Colors.blue,
+              isFullWidth: true,
+            ),
+            const SizedBox(height: 20),
+
+            // 4. ЭФФЕКТИВНОСТЬ МЕСЯЦА
+            Container(
+              padding: const EdgeInsets.all(15),
+              decoration: BoxDecoration(
+                color: Colors.green.shade50,
+                borderRadius: BorderRadius.circular(15),
+                border: Border.all(color: Colors.green.shade200),
+              ),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'Эффективность месяца',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      Text(
+                        '${(income == 0 ? 0 : (netProfit / income * 100)).toInt()}%',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
+                    child: LinearProgressIndicator(
+                      value: income == 0
+                          ? 0.0
+                          : (netProfit / income).clamp(0, 1).toDouble(),
+                      minHeight: 10,
+                      backgroundColor: Colors.white,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        Colors.green.shade700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // 5. КНОПКИ ДОБАВЛЕНИЯ
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () => _showAddDialog(context, provider, true),
+                    icon: const Icon(Icons.add),
+                    label: const Text('Записать доход'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _showAddDialog(context, provider, false),
+                    icon: const Icon(Icons.remove, color: Colors.red),
+                    label: const Text(
+                      'Записать расход',
+                      style: TextStyle(color: Colors.red),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+
+            // 6. ИСТОРИЯ ОПЕРАЦИЙ
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'История операций:',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            // Сюда выводится твой список транзакций
+            _buildTransactionList(provider),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Маленький помощник для рисования карточек (ИСПРАВЛЕННЫЙ)
+  Widget _statBox(
+    String title,
+    String val,
+    Color color, {
+    bool isFullWidth = false,
+  }) {
+    Widget box = Container(
+      width: isFullWidth ? double.infinity : null,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color),
+      ),
+      child: Column(
+        children: [
+          Text(title, style: TextStyle(fontSize: 12, color: color)),
+          Text(
+            val,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+        ],
+      ),
+    );
+
+    // Если на всю ширину - не оборачиваем в Expanded, чтобы избежать ошибок скролла
+    return isFullWidth ? box : Expanded(child: box);
+  }
+
+  // Окно добавления Дохода/Расхода
+  void _showAddDialog(BuildContext context, DataBaseProvider p, bool isIncome) {
+    final tC = TextEditingController();
+    final aC = TextEditingController();
+
+    // Категория по умолчанию
+    String selectedCategory = isIncome ? 'Проживание' : 'Прочее';
+
+    showDialog(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(isIncome ? 'Добавить доход' : 'Добавить расход'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Выбор категории
+              DropdownButtonFormField<String>(
+                initialValue: selectedCategory,
+                decoration: const InputDecoration(labelText: 'Категория'),
+                items: (isIncome ? incomeCategories : expenseCategories)
+                    .map(
+                      (cat) => DropdownMenuItem(value: cat, child: Text(cat)),
+                    )
+                    .toList(),
+                onChanged: (val) {
+                  setDialogState(() {
+                    selectedCategory = val!;
+                  });
+                },
+              ),
+              TextField(
+                controller: tC,
+                decoration: const InputDecoration(
+                  labelText: 'Название (комментарий)',
+                ),
+              ),
+              TextField(
+                controller: aC,
+                decoration: const InputDecoration(labelText: 'Сумма'),
+                keyboardType: TextInputType.number,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(c),
+              child: const Text('Отмена'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                if (tC.text.isNotEmpty && aC.text.isNotEmpty) {
+                  String finalTitle = '[$selectedCategory] ${tC.text}';
+
+                  if (isIncome) {
+                    p.addIncome(finalTitle, int.parse(aC.text), _selectedMonth);
+                  } else {
+                    p.addExpense(
+                      finalTitle,
+                      int.parse(aC.text),
+                      _selectedMonth,
+                    );
+                  }
+                  Navigator.pop(c);
+                }
+              },
+              child: const Text('ОК'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Список операций (исправляем 4 ошибки 'expense')
+  Widget _buildTransactionList(DataBaseProvider provider) {
+    // 1. Берем УЖЕ ГОТОВЫЕ списки из провайдера (они там всегда актуальны благодаря listenToTransactions)
+    // Фильтруем по выбранному месяцу
+    final monthIncomes = provider.incomes
+        .where(
+          (i) =>
+              i.date.year == _selectedMonth.year &&
+              i.date.month == _selectedMonth.month,
+        )
+        .toList();
+
+    final monthExpenses = provider.expenses
+        .where(
+          (e) =>
+              e.date.year == _selectedMonth.year &&
+              e.date.month == _selectedMonth.month,
+        )
+        .toList();
+
+    // Соединяем в один список для истории
+    final List<Map<String, dynamic>> items = [
+      ...monthIncomes.map((d) => {'doc': d, 'type': 'income'}),
+      ...monthExpenses.map((d) => {'doc': d, 'type': 'expense'}),
+    ];
+
+    // Сортируем: новые сверху
+    items.sort((a, b) => (b['doc'].date).compareTo(a['doc'].date));
+
+    if (items.isEmpty) {
+      return const Center(child: Text("Нет операций за этот месяц"));
+    }
+
+    return ListView.builder(
+      // КРИТИЧЕСКИЕ НАСТРОЙКИ ДЛЯ СКРОЛЛА:
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: items.length,
+      itemBuilder: (context, index) {
+        final item = items[index];
+        final data = item['doc']; // Это уже объект Income или Expense
+        final bool isIncomeItem = item['type'] == 'income';
+
+        return Dismissible(
+          key: Key(data.id),
+          // Используем уникальный ID из базы
+          direction: DismissDirection.endToStart,
+          background: Container(
+            color: Colors.red,
+            alignment: Alignment.centerRight,
+            padding: const EdgeInsets.only(right: 20),
+            child: const Icon(Icons.delete, color: Colors.white),
+          ),
+          onDismissed: (direction) {
+            // Просто вызываем удаление, провайдер сам обновит экран
+            if (isIncomeItem) {
+              provider.deleteIncome(data.id);
+            } else {
+              provider.deleteExpense(data.id);
+            }
+          },
+          child: ListTile(
+            title: Text(data.title),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(DateFormat('dd.MM.yyyy').format(data.date)),
+                // Ищем предоплату прямо из списка броней, не трогая саму математику дохода
+                if (isIncomeItem &&
+                    provider.bookings.any(
+                      (b) => b.id == data.id && b.prepayment > 0,
+                    ))
+                  Text(
+                    'В т.ч. предоплата: ${provider.bookings.firstWhere((b) => b.id == data.id).prepayment} ₽',
+                    style: const TextStyle(
+                      color: Colors.blueGrey,
+                      fontSize: 12,
+                    ),
+                  ),
+              ],
+            ),
+            trailing: Text(
+              '${isIncomeItem ? "+" : "-"}${data.amount} ₽',
+              // Сумма остается полной!
+              style: TextStyle(
+                color: isIncomeItem ? Colors.green : Colors.red,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// --- Вкладка Цены ---
+class AdminPricesTab extends StatelessWidget {
+  const AdminPricesTab({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    // Подключаемся к базе данных
+    final provider = Provider.of<DataBaseProvider>(context);
+    // Собираем всё: домики и доп. услуги
+    final allItems = [...provider.accommodations, ...provider.services];
+
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: allItems.length,
+      itemBuilder: (context, index) {
+        final item = allItems[index];
+        return Card(
+          elevation: 2,
+          margin: const EdgeInsets.only(bottom: 12),
+          child: ListTile(
+            title: Text(
+              item.title,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            subtitle: Text('Текущая цена: ${item.price} ₽ / ${item.unit}'),
+            trailing: const Icon(Icons.edit, color: Colors.blue),
+            // Иконка карандаша
+            onTap: () => _showEditPriceDialog(context, provider, item),
+          ),
+        );
+      },
+    );
+  }
+
+  // Окно для изменения цены
+  void _showEditPriceDialog(
+    BuildContext context,
+    DataBaseProvider provider,
+    BookingItem item,
+  ) {
+    final controller = TextEditingController(text: item.price.toString());
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Изменить цену: ${item.title}'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            labelText: 'Новая цена (₽)',
+            border: OutlineInputBorder(),
+          ),
+          keyboardType: TextInputType.number,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final newPrice = int.tryParse(controller.text);
+              if (newPrice != null) {
+                // Вызываем метод обновления в провайдере
+                provider.updateItemPrice(item.id, newPrice);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class MonthlySummaryWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context);
+    final now = DateTime.now();
+    final profit = provider.monthlyNetProfit(now.month, now.year);
+    final income = provider.monthlyIncomes(now.month, now.year);
+    final expense = provider.monthlyExpenses(now.month, now.year);
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.blueGrey[900],
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        children: [
+          Text(
+            "Итог за ${DateFormat('MMMM', 'ru').format(now)}",
+            style: const TextStyle(color: Colors.white70, fontSize: 16),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            "${profit.toInt()} ₽",
+            style: TextStyle(
+              color: profit >= 0 ? Colors.greenAccent : Colors.redAccent,
+              fontSize: 32,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const Divider(color: Colors.white24, height: 25),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _statItem("Доход", "+${income.toInt()}", Colors.green),
+              _statItem("Расход", "-${expense.toInt()}", Colors.orange),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _statItem(String label, String value, Color color) {
+    return Column(
+      children: [
+        Text(
+          label,
+          style: const TextStyle(color: Colors.white60, fontSize: 12),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: color,
+            fontWeight: FontWeight.bold,
+            fontSize: 18,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class FinancialPieChart extends StatelessWidget {
+  final double income;
+  final double expense;
+
+  const FinancialPieChart({
+    super.key,
+    required this.income,
+    required this.expense,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // 1. Используем .abs(), чтобы точно не было отрицательных чисел (из-за них часто летит ошибка)
+    final double safeIncome = income.abs();
+    final double safeExpense = expense.abs();
+
+    // 2. Если всё по нулям, просто выводим текст, не запуская диаграмму
+    if (safeIncome == 0 && safeExpense == 0) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 30),
+        child: Center(
+          child: Text(
+            "Нет данных за этот период",
+            style: TextStyle(color: Colors.grey),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10),
+        ],
+      ),
+      child: Column(
+        children: [
+          const Text(
+            "Статистика",
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+          ),
+          const SizedBox(height: 20),
+          SizedBox(
+            height: 150,
+            child: PieChart(
+              PieChartData(
+                sectionsSpace: 2,
+                centerSpaceRadius: 40,
+                // 3. Рисуем секцию только если значение больше 0
+                sections: [
+                  if (safeIncome > 0)
+                    PieChartSectionData(
+                      value: safeIncome,
+                      title: '',
+                      color: Colors.greenAccent[700],
+                      radius: 20,
+                    ),
+                  if (safeExpense > 0)
+                    PieChartSectionData(
+                      value: safeExpense,
+                      title: '',
+                      color: Colors.redAccent,
+                      radius: 20,
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _indicator(
+                Colors.greenAccent[700]!,
+                "Доходы",
+                "${safeIncome.toInt()} ₽",
+              ),
+              _indicator(
+                Colors.redAccent,
+                "Расходы",
+                "${safeExpense.toInt()} ₽",
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _indicator(Color color, String label, String amount) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        Text(amount, style: const TextStyle(fontWeight: FontWeight.bold)),
+      ],
+    );
+  }
+}
+
+class AdminManagementTab extends StatelessWidget {
+  const AdminManagementTab({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context);
+
+    return ListView(
+      padding: const EdgeInsets.all(10),
+      children: [
+        // --- НОВЫЙ БЛОК: УПРАВЛЕНИЕ СЕЗОНОМ ---
+        Card(
+          elevation: 4,
+          color: Colors.orange.shade50,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(15),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.date_range, color: Colors.orange),
+                    SizedBox(width: 10),
+                    Text(
+                      'Рабочий сезон турбазы',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  provider.seasonStart != null && provider.seasonEnd != null
+                      ? 'Сезон открыт:\nс ${DateFormat('dd.MM.yyyy').format(provider.seasonStart!)} по ${DateFormat('dd.MM.yyyy').format(provider.seasonEnd!)}'
+                      : 'Сезон не задан (бронирование доступно весь год)',
+                  style: const TextStyle(fontSize: 15),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton.icon(
+                  onPressed: () async {
+                    final picked = await showDateRangePicker(
+                      context: context,
+                      firstDate: DateTime(DateTime.now().year),
+                      lastDate: DateTime(DateTime.now().year + 2),
+                      initialDateRange:
+                          provider.seasonStart != null &&
+                              provider.seasonEnd != null
+                          ? DateTimeRange(
+                              start: provider.seasonStart!,
+                              end: provider.seasonEnd!,
+                            )
+                          : null,
+                    );
+                    if (picked != null) {
+                      provider.saveSeasonSettings(picked.start, picked.end);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Даты сезона обновлены!')),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.edit_calendar),
+                  label: const Text('Изменить даты сезона'),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 10),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 8.0, vertical: 10),
+          child: Text(
+            'Управление объектами:',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+        ),
+
+        // --- СТАРЫЙ СПИСОК ДОМИКОВ ---
+        // --- СТАРЫЙ СПИСОК ДОМИКОВ (Без комбо-объектов) ---
+        ...provider.accommodations
+            .where((item) => item.id != 'combo_base' && item.id != 'combo_teremok')
+            .map((item) {
+          final descController = TextEditingController(text: item.description);
+          return Card(
+            elevation: 4,
+            margin: const EdgeInsets.only(bottom: 20),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(15),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                ClipRRect(
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(15),
+                  ),
+                  child: AccommodationImageSlider(item: item),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    children: [
+                      Text(
+                        item.title,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      // Кнопка загрузки из галереи
+                      ElevatedButton.icon(
+                        onPressed: () async {
+                          final picker = ImagePicker();
+                          final pickedFile = await picker.pickImage(
+                            source: ImageSource.gallery,
+                          );
+                          if (pickedFile != null) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Загружаем фото...'),
+                              ),
+                            );
+                            bool success = await provider
+                                .uploadPhotoToAccommodation(
+                                  item.id,
+                                  pickedFile,
+                                );
+                            if (success) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Фото добавлено!'),
+                                ),
+                              );
+                            } else {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'Ошибка при загрузке. Проверьте консоль.',
+                                  ),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
+                            }
+                          }
+                        },
+                        icon: const Icon(Icons.add_a_photo),
+                        label: const Text('Добавить фото'),
+                      ),
+                      if (item.images.isNotEmpty) ...[
+                        const Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            'Управление фото:',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.grey,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        SizedBox(
+                          height: 70, // Высота миниатюр
+                          child: ListView.builder(
+                            scrollDirection: Axis.horizontal,
+                            itemCount: item.images.length,
+                            itemBuilder: (context, photoIndex) {
+                              String photoUrl = item.images[photoIndex];
+                              return Stack(
+                                children: [
+                                  // Сама миниатюра
+                                  Container(
+                                    margin: const EdgeInsets.only(
+                                      right: 12,
+                                      top: 8,
+                                    ),
+                                    width: 80,
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(10),
+                                      image: DecorationImage(
+                                        image: NetworkImage(photoUrl),
+                                        fit: BoxFit.cover,
+                                      ),
+                                    ),
+                                  ),
+                                  // Красный крестик для удаления
+                                  Positioned(
+                                    top: 0,
+                                    right: 4,
+                                    child: GestureDetector(
+                                      onTap: () {
+                                        provider.deletePhotoFromAccommodation(
+                                          item.id,
+                                          photoUrl,
+                                        );
+                                        ScaffoldMessenger.of(
+                                          context,
+                                        ).showSnackBar(
+                                          const SnackBar(
+                                            content: Text('Фото удалено'),
+                                          ),
+                                        );
+                                      },
+                                      child: Container(
+                                        padding: const EdgeInsets.all(4),
+                                        decoration: const BoxDecoration(
+                                          color: Colors.red,
+                                          shape: BoxShape.circle,
+                                        ),
+                                        child: const Icon(
+                                          Icons.close,
+                                          color: Colors.white,
+                                          size: 14,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                      const Divider(),
+
+                      // Редактирование описания
+                      TextField(
+                        controller: descController,
+                        maxLines: 3,
+                        decoration: const InputDecoration(
+                          labelText: 'Описание домика',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blueGrey,
+                        ),
+                        onPressed: () {
+                          provider.updateAccommodationDescription(
+                            item.id,
+                            descController.text,
+                          );
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Описание сохранено')),
+                          );
+                        },
+                        child: const Text(
+                          'Сохранить описание',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+        }).toList(),
+      ],
+    );
+  }
+}
+
+class BookingTransaction {
+  final String itemId;
+  final DateTime startDate;
+  final DateTime endDate;
+  final String userId;
+
+  BookingTransaction({
+    required this.itemId,
+    required this.startDate,
+    required this.endDate,
+    this.userId = '',
+  });
+}
+
+class MonthAdminView extends StatelessWidget {
+  final DateTime month;
+
+  const MonthAdminView({super.key, required this.month});
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context);
+    // Определяем количество дней в месяце
+    int daysInMonth = DateTime(month.year, month.month + 1, 0).day;
+
+    return Scaffold(
+      appBar: AppBar(title: Text(DateFormat('MMMM yyyy', 'ru').format(month))),
+      body: GridView.builder(
+        padding: const EdgeInsets.all(10),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 7, // 7 дней недели
+          mainAxisSpacing: 8,
+          crossAxisSpacing: 8,
+        ),
+        itemCount: daysInMonth,
+        itemBuilder: (context, index) {
+          final day = DateTime(month.year, month.month, index + 1);
+          final status = provider.getDayStatus(day);
+
+          Color bgColor = Colors.green.shade100;
+          if (status['bookedCount'] > 0) bgColor = Colors.orange.shade100;
+          if (status['isFull']) bgColor = Colors.red.shade100;
+
+          return GestureDetector(
+            onTap: () =>
+                _showDayDetails(context, day, status['bookedIds'], provider),
+            child: Container(
+              decoration: BoxDecoration(
+                color: bgColor,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: status['bookedCount'] > 0
+                      ? Colors.orange
+                      : Colors.green,
+                ),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    '${index + 1}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    '${status['bookedCount']}/${status['totalCapacity']}',
+                    style: const TextStyle(fontSize: 10),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showDayDetails(
+    BuildContext context,
+    DateTime day,
+    List<String> bookedIds,
+    DataBaseProvider provider,
+  ) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Загрузка на ${DateFormat('dd.MM').format(day)}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: provider.accommodations.map((item) {
+            // Считаем сколько раз этот конкретный домик забронирован сегодня
+            int count = bookedIds.where((id) => id == item.id).length;
+            return ListTile(
+              title: Text(item.title),
+              trailing: Text('$count / ${item.capacity}'),
+              subtitle: Text(
+                count >= item.capacity ? 'Мест нет' : 'Есть свободные номера',
+              ),
+              leading: Icon(
+                Icons.home,
+                color: count >= item.capacity ? Colors.red : Colors.green,
+              ),
+            );
+          }).toList(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- НОВАЯ Вкладка Отчеты (Аналитика и Налоги) ---
+// --- НОВАЯ Вкладка Отчеты (Аналитика и Налоги) ---
+class AdminReportsTab extends StatefulWidget {
+  const AdminReportsTab({super.key});
+
+  @override
+  State<AdminReportsTab> createState() => _AdminReportsTabState();
+}
+
+class _AdminReportsTabState extends State<AdminReportsTab> {
+  int _selectedYear = DateTime.now().year;
+  int _selectedTaxMonth = DateTime.now().month;
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = Provider.of<DataBaseProvider>(context);
+
+    // --- ЛОГИКА ДЛЯ НАЛОГОВОЙ (ОНА РАБОТАЛА, ТАК КАК ДОХОДЫ ИДУТ ИЗ FIREBASE) ---
+    final taxIncome = provider.incomes
+        .where(
+          (i) =>
+              i.date.year == _selectedYear && i.date.month == _selectedTaxMonth,
+        )
+        .fold(0.0, (sum, item) => sum + item.amount);
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ВЫБОР ГОДА (Общий для всего экрана)
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Аналитика за:',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              DropdownButton<int>(
+                value: _selectedYear,
+                items: [2024, 2025, 2026, 2027]
+                    .map(
+                      (y) => DropdownMenuItem(value: y, child: Text('$y год')),
+                    )
+                    .toList(),
+                onChanged: (val) => setState(() => _selectedYear = val!),
+              ),
+            ],
+          ),
+          const Divider(),
+
+          // БЛОК 1: ДЛЯ НАЛОГОВОЙ
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.blue.shade50,
+              borderRadius: BorderRadius.circular(15),
+              border: Border.all(color: Colors.blue.shade200),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'Сводка для "Мой Налог"',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ),
+                    ),
+                    DropdownButton<int>(
+                      value: _selectedTaxMonth,
+                      items: List.generate(12, (index) => index + 1).map((m) {
+                        return DropdownMenuItem(
+                          value: m,
+                          child: Text(
+                            DateFormat('MMMM', 'ru').format(DateTime(2000, m)),
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: (val) =>
+                          setState(() => _selectedTaxMonth = val!),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'Сумма поступлений за месяц (без вычета расходов):',
+                  style: TextStyle(color: Colors.blueGrey, fontSize: 12),
+                ),
+                Text(
+                  '${taxIncome.toInt()} ₽',
+                  style: const TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.blue,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '* Эту сумму необходимо задекларировать в приложении ФНС',
+                  style: TextStyle(
+                    color: Colors.grey.shade600,
+                    fontSize: 11,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // БЛОК 2: РЕЙТИНГ ПРИБЫЛЬНОСТИ ЖИЛЬЯ ЗА ГОД
+          const Text(
+            'Выручка по объектам за год',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+          ),
+          const SizedBox(height: 10),
+
+          // --- ИСПРАВЛЕНИЕ: ЧИТАЕМ ДАННЫЕ НАПРЯМУЮ ИЗ FIREBASE ---
+          StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance
+                .collection('${provider.prefix}bookings')
+                .snapshots(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              // Создаем мапу: {ID домика: Общая заработанная сумма}
+              Map<String, int> itemProfits = {};
+              for (var a in provider.accommodations) {
+                itemProfits[a.id] = 0; // Инициализируем нулями
+              }
+
+              if (snapshot.hasData) {
+                for (var doc in snapshot.data!.docs) {
+                  final data = doc.data() as Map<String, dynamic>;
+                  try {
+                    bool isConfirmed = data['isConfirmed'] ?? false;
+                    if (isConfirmed && data['startDate'] != null) {
+                      DateTime sDate = DateTime.parse(data['startDate']);
+
+                      // Считаем только за выбранный год
+                      if (sDate.year == _selectedYear) {
+                        String itemId = data['itemId'];
+                        int price = data['totalPrice'] ?? 0;
+
+                        if (itemProfits.containsKey(itemId)) {
+                          itemProfits[itemId] = itemProfits[itemId]! + price;
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    // Игнорируем кривые брони
+                  }
+                }
+              }
+
+              // Сортируем домики по прибыльности (от большего к меньшему)
+              var sortedItems = itemProfits.entries.toList()
+                ..sort((a, b) => b.value.compareTo(a.value));
+
+              return Column(
+                children: sortedItems.map((entry) {
+                  // Находим название домика по ID
+                  String itemName = provider.accommodations
+                      .firstWhere(
+                        (a) => a.id == entry.key,
+                        orElse: () => BookingItem(
+                          id: '',
+                          title: 'Удаленный объект',
+                          price: 0,
+                          type: ItemType.accommodation,
+                        ),
+                      )
+                      .title;
+                  int profit = entry.value;
+
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: profit > 0
+                            ? Colors.green.shade100
+                            : Colors.grey.shade200,
+                        child: Icon(
+                          Icons.house,
+                          color: profit > 0 ? Colors.green : Colors.grey,
+                        ),
+                      ),
+                      title: Text(
+                        itemName,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      trailing: Text(
+                        '$profit ₽',
+                        style: TextStyle(
+                          color: profit > 0 ? Colors.green : Colors.grey,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- Диалог ручного добавления (ИСПРАВЛЯЕТ ОШИБКУ AddManualBookingDialog) ---
+class AddManualBookingDialog extends StatelessWidget {
+  const AddManualBookingDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return BookingDialog(
+      item: BookingItem(
+        id: 'manual',
+        title: 'Ручное бронирование',
+        description: '',
+        price: 0,
+        unit: 'услуга',
+        type: ItemType.custom,
+        image: '',
+      ),
+    );
+  }
+}
+ы
